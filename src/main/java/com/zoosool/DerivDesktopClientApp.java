@@ -29,23 +29,28 @@ public class DerivDesktopClientApp extends Application {
     public void init() {
         DerivAppConfig cfg = DerivAppConfig.load(Path.of("config.deriv.properties"));
 
-        // One shared IO executor for connector connect flow and any future background tasks.
         appIoExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "app-io");
             t.setDaemon(true);
             return t;
         });
 
-        // State controller can notify UI safely (AppLogView.logger() is UI-safe already, but this will help later for buttons).
         ConnectionStateController state = new DefaultConnectionStateController(
                 ConnectionState.DISCONNECTED,
                 Platform::runLater,
                 appLogView.logger()
         );
 
-        connector = new DefaultDerivConnector(cfg, appLogView.logger(), state, appIoExecutor);
+        TickHandler tickHandler = new TickHandler(appLogView.logger());
+        DerivTickSubscriptionsService derivTickSubscriptionsService = new DerivTickSubscriptionsService(appLogView.logger());
+        connector = new DefaultDerivConnector(
+                cfg,
+                appLogView.logger(),
+                state,
+                appIoExecutor,
+                tickHandler,
+                derivTickSubscriptionsService);
 
-        // First connect: allowed in init() (not FX thread). If this fails, app will still start, but UI will show empty data.
         DerivSession derivSession = connector.ping().join();
 
         DerivTradingService trading = new DerivTradingService(connector, derivSession.currency());
@@ -53,7 +58,6 @@ public class DerivDesktopClientApp extends Application {
 
         derivClientMainWindow = new DerivClientMainWindow(derivController, derivSession, appLogView);
 
-        // Ping scheduler is created, but started in start() when stage exists (optional).
         pingScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "app-ping");
             t.setDaemon(true);

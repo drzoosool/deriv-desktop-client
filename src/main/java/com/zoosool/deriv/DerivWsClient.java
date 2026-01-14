@@ -8,7 +8,6 @@ import org.java_websocket.handshake.ServerHandshake;
 
 import java.net.URI;
 import java.time.Instant;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -22,6 +21,7 @@ public class DerivWsClient extends WebSocketClient {
     private final ObjectMapper mapper = new ObjectMapper();
     private final AtomicInteger reqSeq = new AtomicInteger(1);
     private final Map<Integer, CompletableFuture<JsonNode>> pending = new ConcurrentHashMap<>();
+    private final TickHandler tickHandler;
 
     private final String token;
     private final Consumer<String> log;
@@ -29,22 +29,19 @@ public class DerivWsClient extends WebSocketClient {
     private final CompletableFuture<JsonNode> authorizeResp = new CompletableFuture<>();
 
     /**
-     * Optional callback used by higher-level connector to react on socket close/error.
+     * Optional callback used by a higher-level connector to react on socket close/error.
      * First argument is a short "where" marker, second is the exception (may be null for close).
      */
     private volatile BiConsumer<String, Exception> disconnectListener;
 
-    // Tick subscription state (MVP)
-    private volatile String step100Symbol;
-    private volatile String tickSubscriptionId;
-
-    public DerivWsClient(URI serverUri, String token, Consumer<String> log) {
+    public DerivWsClient(URI serverUri, String token, Consumer<String> log, TickHandler tickHandler) {
         super(serverUri);
         if (token == null || token.isBlank()) {
             throw new IllegalArgumentException("Deriv token must not be blank");
         }
         this.token = token;
         this.log = (log != null) ? log : System.out::println;
+        this.tickHandler = tickHandler;
     }
 
     public void setDisconnectListener(BiConsumer<String, Exception> disconnectListener) {
@@ -64,7 +61,7 @@ public class DerivWsClient extends WebSocketClient {
 
         sendRequest(auth)
                 .thenAccept(resp -> {
-                    log("✅ Authorized");
+                    log("✅ Authorized: " + compactJson(resp));
                     authorizeResp.complete(resp);
                 })
                 .exceptionally(ex -> {
@@ -79,9 +76,9 @@ public class DerivWsClient extends WebSocketClient {
     public void onMessage(String message) {
         try {
             JsonNode node = mapper.readTree(message);
-
             String msgType = node.path("msg_type").asText("");
 
+            // 1) Complete pending request futures (req_id correlation)
             JsonNode reqIdNode = node.get("req_id");
             if (reqIdNode != null && reqIdNode.isInt()) {
                 int reqId = reqIdNode.asInt();
@@ -95,40 +92,27 @@ public class DerivWsClient extends WebSocketClient {
                 }
             }
 
+            // 2) Handle pushes
             if ("pong".equals(msgType)) {
+                // Usually too noisy; ignore by default.
                 return;
             }
 
             if ("tick".equals(msgType)) {
-                handleTick(node);
+                tickHandler.onTick(node);
                 return;
             }
 
+            // 3) Log other push messages to understand the stream
             if (!msgType.isBlank()) {
-                log("📩 msg_type=" + msgType);
+                log("📩 PUSH msg_type=" + msgType + " raw=" + compactJson(node));
             } else {
-                log("📩 push message without msg_type");
+                log("📩 PUSH without msg_type raw=" + compactJson(node));
             }
 
         } catch (Exception ex) {
             log("❗ parse error: " + ex.getMessage());
         }
-    }
-
-    private void handleTick(JsonNode node) {
-        JsonNode tick = node.path("tick");
-        double quote = tick.path("quote").asDouble(Double.NaN);
-        long epoch = tick.path("epoch").asLong(0);
-
-        JsonNode subId = node.path("subscription").path("id");
-        if (subId.isTextual()) {
-            tickSubscriptionId = subId.asText();
-        }
-
-        log("📈 TICK " + (step100Symbol != null ? step100Symbol : "?")
-                + " quote=" + quote
-                + " epoch=" + epoch
-                + (tickSubscriptionId != null ? " subId=" + tickSubscriptionId : ""));
     }
 
     @Override
@@ -176,66 +160,10 @@ public class DerivWsClient extends WebSocketClient {
         return f;
     }
 
-    /**
-     * MVP: detect symbol for Step Index 100 and subscribe to its ticks.
-     * (Kept for future use; not used by default.)
-     */
-    @SuppressWarnings("unused")
-    private void subscribeStepIndex100Ticks() {
-        // 1) find symbol via active_symbols
-        ObjectNode req = mapper.createObjectNode();
-        req.put("active_symbols", "brief");
-        req.put("product_type", "basic");
-
-        sendRequest(req)
-                .thenApply(this::findStepIndex100Symbol)
-                .thenCompose(symbol -> {
-                    this.step100Symbol = symbol;
-                    log("🔎 Step Index 100 symbol resolved: " + symbol);
-
-                    // 2) subscribe to ticks
-                    ObjectNode ticks = mapper.createObjectNode();
-                    ticks.put("ticks", symbol);
-                    ticks.put("subscribe", 1);
-
-                    return sendRequest(ticks);
-                })
-                .thenAccept(resp -> {
-                    // initial subscription response usually contains tick + subscription.id
-                    JsonNode subId = resp.path("subscription").path("id");
-                    if (subId.isTextual()) {
-                        tickSubscriptionId = subId.asText();
-                    }
-                    log("✅ Tick subscription started"
-                            + (tickSubscriptionId != null ? " subId=" + tickSubscriptionId : ""));
-                })
-                .exceptionally(ex -> {
-                    log("❌ Tick subscribe failed: " + rootMessage(ex));
-                    return null;
-                });
-    }
-
-    private String findStepIndex100Symbol(JsonNode resp) {
-        JsonNode list = resp.path("active_symbols");
-        if (!list.isArray()) {
-            throw new IllegalStateException("active_symbols not array: " + resp);
-        }
-
-        for (JsonNode s : list) {
-            String display = s.path("display_name").asText("");
-            String displayL = display.toLowerCase(Locale.ROOT);
-            if (displayL.contains("step index") && displayL.contains("100")) {
-                String sym = s.path("symbol").asText(null);
-                if (sym != null && !sym.isBlank()) return sym;
-            }
-        }
-
-        throw new IllegalStateException("Cannot find Step Index 100 in active_symbols");
-    }
-
     private void fireDisconnect(String where, Exception ex) {
         BiConsumer<String, Exception> l = disconnectListener;
         if (l == null) return;
+
         try {
             l.accept(where, ex);
         } catch (Exception ignore) {
@@ -245,6 +173,16 @@ public class DerivWsClient extends WebSocketClient {
 
     private void log(String s) {
         log.accept("[" + Instant.now() + "] " + s);
+    }
+
+    private String compactJson(JsonNode node) {
+        try {
+            // Ensures single-line JSON (no pretty print)
+            return mapper.writeValueAsString(node);
+        } catch (Exception ex) {
+            // Fallback: JsonNode#toString is typically already compact.
+            return String.valueOf(node);
+        }
     }
 
     private static String rootMessage(Throwable t) {

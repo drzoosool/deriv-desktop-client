@@ -20,9 +20,11 @@ public final class DefaultDerivConnector implements DerivConnector {
     private final DerivAppConfig cfg;
     private final Consumer<String> log;
     private final ConnectionStateController state;
+    private final Executor connectExecutor;
+    private final DerivTickSubscriptionsService tickSubscriptions;
+    private final TickHandler tickHandler;
 
     private final ObjectMapper mapper = new ObjectMapper();
-
     private final Object swapLock = new Object();
 
     private volatile DerivWsClient ws;
@@ -30,18 +32,20 @@ public final class DefaultDerivConnector implements DerivConnector {
 
     private volatile CompletableFuture<DerivSession> connectingFuture;
 
-    private final Executor connectExecutor;
-
     public DefaultDerivConnector(
             DerivAppConfig cfg,
             Consumer<String> log,
             ConnectionStateController state,
-            Executor connectExecutor
+            Executor connectExecutor,
+            TickHandler tickHandler,
+            DerivTickSubscriptionsService tickSubscriptions
     ) {
         this.cfg = Objects.requireNonNull(cfg, "cfg");
         this.log = Objects.requireNonNull(log, "log");
         this.state = Objects.requireNonNull(state, "state");
         this.connectExecutor = Objects.requireNonNull(connectExecutor, "connectExecutor");
+        this.tickHandler = Objects.requireNonNull(tickHandler, "tickHandler");
+        this.tickSubscriptions = Objects.requireNonNull(tickSubscriptions, "tickSubscriptions");
     }
 
     @Override
@@ -58,7 +62,6 @@ public final class DefaultDerivConnector implements DerivConnector {
         }
 
         if (st == ConnectionState.CONNECTING) {
-            // Someone already started connecting; do not start another one.
             CompletableFuture<DerivSession> f = connectingFuture;
             return (f != null)
                     ? f
@@ -66,7 +69,6 @@ public final class DefaultDerivConnector implements DerivConnector {
         }
 
         if (st == ConnectionState.CONNECTED) {
-            // Fire-and-forget ping; if sending fails -> invalidate.
             try {
                 DerivWsClient cur = this.ws;
                 if (cur == null || !cur.isOpen()) {
@@ -83,23 +85,19 @@ public final class DefaultDerivConnector implements DerivConnector {
 
             DerivSession s = this.session;
             if (s == null) {
-                // Should never happen in CONNECTED, but keep it defensive.
                 invalidate(new IllegalStateException("Session is null in CONNECTED"), "ping/session-null");
                 return CompletableFuture.failedFuture(new IllegalStateException("Session is not ready"));
             }
             return CompletableFuture.completedFuture(s);
         }
 
-        // DISCONNECTED -> start connecting (CAS)
         if (!state.compareAndSet(ConnectionState.DISCONNECTED, ConnectionState.CONNECTING, "ping/start-connect")) {
-            // State changed between reads; retry by delegation.
             return ping();
         }
 
         CompletableFuture<DerivSession> f = new CompletableFuture<>();
         connectingFuture = f;
 
-        // Do not block caller thread (especially JavaFX). Connect asynchronously.
         CompletableFuture.runAsync(() -> doConnect(f), connectExecutor);
 
         return f;
@@ -107,12 +105,13 @@ public final class DefaultDerivConnector implements DerivConnector {
 
     private void doConnect(CompletableFuture<DerivSession> f) {
         final DerivWsClient wsLocal;
+
         try {
             if (state.get() == ConnectionState.CLOSED) {
                 f.completeExceptionally(new IllegalStateException("Connector is CLOSED"));
                 return;
             }
-            wsLocal = DerivWebSocketClientFactory.getClient(cfg, log);
+            wsLocal = DerivWebSocketClientFactory.getClient(cfg, log, tickHandler);
         } catch (Throwable ex) {
             connectingFuture = null;
             if (state.get() != ConnectionState.CLOSED) {
@@ -139,6 +138,9 @@ public final class DefaultDerivConnector implements DerivConnector {
                     )
                     .join();
 
+            // Re-subscribe on every successful connect/reconnect
+            tickSubscriptions.subscribeAll(wsLocal, newSession.stepIndices()).join();
+
             DerivWsClient oldWs;
             synchronized (swapLock) {
                 oldWs = this.ws;
@@ -164,7 +166,6 @@ public final class DefaultDerivConnector implements DerivConnector {
             f.completeExceptionally(ex);
         }
     }
-
 
     private CompletableFuture<List<ActiveSymbol>> loadActiveSymbols(DerivWsClient ws) {
         ObjectNode req = mapper.createObjectNode();
@@ -198,7 +199,6 @@ public final class DefaultDerivConnector implements DerivConnector {
 
         ConnectionState st = state.get();
         if (st != ConnectionState.CONNECTED) {
-            // Never reconnect here.
             return CompletableFuture.failedFuture(new IllegalStateException("Not connected: " + st));
         }
 
@@ -220,77 +220,36 @@ public final class DefaultDerivConnector implements DerivConnector {
     public void invalidate(Throwable cause, String where) {
         ConnectionState st = state.get();
 
-        // Do not interfere with CONNECTING or shutdown sequence.
-        if (st == ConnectionState.CLOSED || st == ConnectionState.CONNECTING) {
-            return;
-        }
-        if (st == ConnectionState.DISCONNECTED) {
-            return;
-        }
+        if (st == ConnectionState.CLOSED || st == ConnectionState.CONNECTING) return;
+        if (st == ConnectionState.DISCONNECTED) return;
 
-        // CONNECTED -> DISCONNECTED
         boolean changed = state.compareAndSet(ConnectionState.CONNECTED, ConnectionState.DISCONNECTED, "invalidate/" + where);
-        if (!changed) {
-            return;
-        }
+        if (!changed) return;
 
-        // Close the socket aggressively (best effort).
         DerivWsClient cur = this.ws;
         if (cur != null) {
-            try {
-                cur.close();
-            } catch (Exception ignore) {
-            }
+            try { cur.close(); } catch (Exception ignore) {}
         }
     }
 
     @Override
     public void close() {
-        // If already CLOSED -> nothing to do
-        if (state.get() == ConnectionState.CLOSED) {
-            return;
-        }
+        if (state.get() == ConnectionState.CLOSED) return;
 
         state.set(ConnectionState.CLOSED, "close");
 
-        // Fail any in-flight connect
         CompletableFuture<DerivSession> cf = connectingFuture;
         if (cf != null) {
             cf.completeExceptionally(new CancellationException("Connector closed"));
         }
         connectingFuture = null;
 
-        // Close current socket (best effort)
         DerivWsClient cur = this.ws;
         if (cur != null) {
-            try {
-                cur.close();
-            } catch (Exception ignore) {
-            }
+            try { cur.close(); } catch (Exception ignore) {}
         }
 
         session = null;
         ws = null;
-    }
-
-    // Helper: if you want to debug connect failures, use this for root cause extraction.
-    @SuppressWarnings("unused")
-    private static String rootMessage(Throwable t) {
-        Throwable cur = t;
-        while (cur.getCause() != null) cur = cur.getCause();
-        String msg = cur.getMessage();
-        return (msg == null || msg.isBlank()) ? cur.getClass().getSimpleName() : msg;
-    }
-
-    /**
-     * Convenience factory for a simple dedicated connect executor (daemon thread).
-     * If you already manage executors elsewhere, do not use this and pass your own executor.
-     */
-    public static Executor newDefaultConnectExecutor() {
-        return runnable -> {
-            Thread t = new Thread(runnable, "deriv-connector-connect");
-            t.setDaemon(true);
-            t.start();
-        };
     }
 }
