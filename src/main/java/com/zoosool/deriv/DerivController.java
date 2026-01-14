@@ -11,8 +11,8 @@ public class DerivController implements DerivOperations {
     private final DerivTradingService trading;
 
     public DerivController(DerivTradingService tradingService, Consumer<String> uiLog) {
+        this.trading = Objects.requireNonNull(tradingService, "tradingService");
         this.log = Objects.requireNonNull(uiLog, "uiLog");
-        this.trading = tradingService;
     }
 
     @Override
@@ -27,7 +27,6 @@ public class DerivController implements DerivOperations {
 
     @Override
     public void sell(Contract contract) {
-        // в UI "SELL" = ставим вниз (Fall)
         trading.buyFall(contract)
                 .thenAccept(id -> log.accept("DOWN (Fall) OK contract_id=" + id))
                 .exceptionally(ex -> {

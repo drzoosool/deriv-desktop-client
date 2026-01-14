@@ -10,13 +10,14 @@ import java.net.URI;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.*;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 public class DerivWsClient extends WebSocketClient {
-
-    private static final int PING_PERIOD_SECONDS = 20;
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final AtomicInteger reqSeq = new AtomicInteger(1);
@@ -27,7 +28,11 @@ public class DerivWsClient extends WebSocketClient {
 
     private final CompletableFuture<JsonNode> authorizeResp = new CompletableFuture<>();
 
-    private ScheduledExecutorService pingScheduler;
+    /**
+     * Optional callback used by higher-level connector to react on socket close/error.
+     * First argument is a short "where" marker, second is the exception (may be null for close).
+     */
+    private volatile BiConsumer<String, Exception> disconnectListener;
 
     // Tick subscription state (MVP)
     private volatile String step100Symbol;
@@ -40,6 +45,10 @@ public class DerivWsClient extends WebSocketClient {
         }
         this.token = token;
         this.log = (log != null) ? log : System.out::println;
+    }
+
+    public void setDisconnectListener(BiConsumer<String, Exception> disconnectListener) {
+        this.disconnectListener = disconnectListener;
     }
 
     public CompletableFuture<JsonNode> authorized() {
@@ -57,13 +66,11 @@ public class DerivWsClient extends WebSocketClient {
                 .thenAccept(resp -> {
                     log("✅ Authorized");
                     authorizeResp.complete(resp);
-
-                    startPing();
-                    //subscribeStepIndex100Ticks();
                 })
                 .exceptionally(ex -> {
-                    log("❌ Authorization failed: " + ex.getMessage());
+                    log("❌ Authorization failed: " + rootMessage(ex));
                     authorizeResp.completeExceptionally(ex);
+                    fireDisconnect("authorize", unwrapException(ex));
                     return null;
                 });
     }
@@ -127,9 +134,8 @@ public class DerivWsClient extends WebSocketClient {
     @Override
     public void onClose(int code, String reason, boolean remote) {
         log("❌ WS closed: code=" + code + ", reason=" + reason + ", remote=" + remote);
-        stopPing();
 
-        // fail all pending requests
+        // Fail all pending requests
         RuntimeException ex = new RuntimeException("Socket closed: " + reason);
         pending.forEach((k, f) -> f.completeExceptionally(ex));
         pending.clear();
@@ -137,11 +143,14 @@ public class DerivWsClient extends WebSocketClient {
         if (!authorizeResp.isDone()) {
             authorizeResp.completeExceptionally(ex);
         }
+
+        fireDisconnect("close", ex);
     }
 
     @Override
     public void onError(Exception ex) {
-        log("❗ WS error: " + ex.getMessage());
+        log("❗ WS error: " + (ex != null ? ex.getMessage() : "null"));
+        fireDisconnect("error", ex);
     }
 
     /**
@@ -149,6 +158,8 @@ public class DerivWsClient extends WebSocketClient {
      * If the server responds with "error", the future completes exceptionally.
      */
     public CompletableFuture<JsonNode> sendRequest(ObjectNode req) {
+        Objects.requireNonNull(req, "req");
+
         int reqId = reqSeq.getAndIncrement();
         req.put("req_id", reqId);
 
@@ -167,7 +178,9 @@ public class DerivWsClient extends WebSocketClient {
 
     /**
      * MVP: detect symbol for Step Index 100 and subscribe to its ticks.
+     * (Kept for future use; not used by default.)
      */
+    @SuppressWarnings("unused")
     private void subscribeStepIndex100Ticks() {
         // 1) find symbol via active_symbols
         ObjectNode req = mapper.createObjectNode();
@@ -197,7 +210,7 @@ public class DerivWsClient extends WebSocketClient {
                             + (tickSubscriptionId != null ? " subId=" + tickSubscriptionId : ""));
                 })
                 .exceptionally(ex -> {
-                    log("❌ Tick subscribe failed: " + ex.getMessage());
+                    log("❌ Tick subscribe failed: " + rootMessage(ex));
                     return null;
                 });
     }
@@ -220,37 +233,31 @@ public class DerivWsClient extends WebSocketClient {
         throw new IllegalStateException("Cannot find Step Index 100 in active_symbols");
     }
 
-    private void startPing() {
-        if (pingScheduler != null) return;
-
-        pingScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "deriv-ws-ping");
-            t.setDaemon(true);
-            return t;
-        });
-
-        pingScheduler.scheduleAtFixedRate(() -> {
-            try {
-                ObjectNode ping = mapper.createObjectNode();
-                ping.put("ping", 1);
-                send(ping.toString());
-            } catch (Exception ignored) {
-                // ignore; onError/onClose will handle broken connection
-            }
-        }, PING_PERIOD_SECONDS, PING_PERIOD_SECONDS, TimeUnit.SECONDS);
-
-        log("🫀 Ping started (" + PING_PERIOD_SECONDS + "s)");
-    }
-
-    private void stopPing() {
-        if (pingScheduler != null) {
-            pingScheduler.shutdownNow();
-            pingScheduler = null;
-            log("🫀 Ping stopped");
+    private void fireDisconnect(String where, Exception ex) {
+        BiConsumer<String, Exception> l = disconnectListener;
+        if (l == null) return;
+        try {
+            l.accept(where, ex);
+        } catch (Exception ignore) {
+            // Never let listener exceptions kill the WS thread.
         }
     }
 
     private void log(String s) {
         log.accept("[" + Instant.now() + "] " + s);
+    }
+
+    private static String rootMessage(Throwable t) {
+        Throwable cur = t;
+        while (cur.getCause() != null) cur = cur.getCause();
+        String msg = cur.getMessage();
+        return (msg == null || msg.isBlank()) ? cur.getClass().getSimpleName() : msg;
+    }
+
+    private static Exception unwrapException(Throwable t) {
+        if (t == null) return null;
+        Throwable cur = t;
+        while (cur.getCause() != null) cur = cur.getCause();
+        return (cur instanceof Exception) ? (Exception) cur : new RuntimeException(cur);
     }
 }
