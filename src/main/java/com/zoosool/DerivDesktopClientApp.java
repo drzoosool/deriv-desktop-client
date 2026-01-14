@@ -1,5 +1,9 @@
 package com.zoosool;
 
+import com.zoosool.analyze.DefaultTickStatsCalculator;
+import com.zoosool.analyze.TickEventRouterService;
+import com.zoosool.analyze.TickHandler;
+import com.zoosool.analyze.TickStatsCalculatorFactory;
 import com.zoosool.config.DerivAppConfig;
 import com.zoosool.deriv.*;
 import com.zoosool.model.DerivSession;
@@ -14,6 +18,8 @@ import java.nio.file.Path;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class DerivDesktopClientApp extends Application {
 
@@ -22,6 +28,10 @@ public class DerivDesktopClientApp extends Application {
 
     private ExecutorService appIoExecutor;
     private ScheduledExecutorService pingScheduler;
+
+    // Tick stats routing/processing (per-symbol workers)
+    private ExecutorService tickStatsExecutor;
+    private TickEventRouterService tickEventRouterService;
 
     private DerivConnector connector;
 
@@ -41,15 +51,28 @@ public class DerivDesktopClientApp extends Application {
                 appLogView.logger()
         );
 
-        TickHandler tickHandler = new TickHandler(appLogView.logger());
+        tickStatsExecutor = Executors.newFixedThreadPool(5, newDaemonThreadFactory("tick-stats-"));
+
+        TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, appLogView.logger());
+
+        tickEventRouterService = new TickEventRouterService(
+                appLogView.logger(),
+                tickStatsExecutor,
+                statsCalcFactory,
+                256
+        );
+
+        TickHandler tickHandler = new TickHandler(appLogView.logger(), tickEventRouterService);
         DerivTickSubscriptionsService derivTickSubscriptionsService = new DerivTickSubscriptionsService(appLogView.logger());
+
         connector = new DefaultDerivConnector(
                 cfg,
                 appLogView.logger(),
                 state,
                 appIoExecutor,
                 tickHandler,
-                derivTickSubscriptionsService);
+                derivTickSubscriptionsService
+        );
 
         DerivSession derivSession = connector.ping().join();
 
@@ -77,7 +100,7 @@ public class DerivDesktopClientApp extends Application {
         // Note: ping() is non-blocking; it returns a future.
         pingScheduler.scheduleAtFixedRate(
                 () -> connector.ping().exceptionally(ex -> null),
-                10, 20, java.util.concurrent.TimeUnit.SECONDS
+                10, 20, TimeUnit.SECONDS
         );
     }
 
@@ -90,6 +113,16 @@ public class DerivDesktopClientApp extends Application {
             }
         }
 
+        if (tickEventRouterService != null) {
+            // This also shuts down tickStatsExecutor (router owns the executor lifecycle here).
+            tickEventRouterService.stopAllAndShutdown(TickEventRouterService.DurationLike.seconds(3));
+            tickEventRouterService = null;
+            tickStatsExecutor = null;
+        } else if (tickStatsExecutor != null) {
+            tickStatsExecutor.shutdownNow();
+            tickStatsExecutor = null;
+        }
+
         if (pingScheduler != null) {
             pingScheduler.shutdownNow();
             pingScheduler = null;
@@ -99,5 +132,14 @@ public class DerivDesktopClientApp extends Application {
             appIoExecutor.shutdownNow();
             appIoExecutor = null;
         }
+    }
+
+    private static java.util.concurrent.ThreadFactory newDaemonThreadFactory(String prefix) {
+        AtomicInteger idx = new AtomicInteger(1);
+        return r -> {
+            Thread t = new Thread(r, prefix + idx.getAndIncrement());
+            t.setDaemon(true);
+            return t;
+        };
     }
 }

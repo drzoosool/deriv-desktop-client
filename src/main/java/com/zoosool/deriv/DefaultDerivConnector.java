@@ -3,6 +3,7 @@ package com.zoosool.deriv;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.zoosool.analyze.TickHandler;
 import com.zoosool.config.DerivAppConfig;
 import com.zoosool.model.ActiveSymbol;
 import com.zoosool.model.DerivSession;
@@ -138,7 +139,8 @@ public final class DefaultDerivConnector implements DerivConnector {
                     )
                     .join();
 
-            // Re-subscribe on every successful connect/reconnect
+            tickHandler.onReconnect("connect/new-session");
+
             tickSubscriptions.subscribeAll(wsLocal, newSession.stepIndices()).join();
 
             DerivWsClient oldWs;
@@ -226,6 +228,12 @@ public final class DefaultDerivConnector implements DerivConnector {
         boolean changed = state.compareAndSet(ConnectionState.CONNECTED, ConnectionState.DISCONNECTED, "invalidate/" + where);
         if (!changed) return;
 
+        try {
+            tickHandler.onReconnect("invalidate/" + where);
+        } catch (Exception ignore) {
+            // Do not let stats pipeline affect reconnect logic.
+        }
+
         DerivWsClient cur = this.ws;
         if (cur != null) {
             try { cur.close(); } catch (Exception ignore) {}
@@ -243,6 +251,12 @@ public final class DefaultDerivConnector implements DerivConnector {
             cf.completeExceptionally(new CancellationException("Connector closed"));
         }
         connectingFuture = null;
+
+        try {
+            tickHandler.onReconnect("close");
+        } catch (Exception ignore) {
+            // ignore
+        }
 
         DerivWsClient cur = this.ws;
         if (cur != null) {

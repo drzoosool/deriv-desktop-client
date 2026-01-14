@@ -1,5 +1,6 @@
 package com.zoosool.deriv;
 
+import com.zoosool.analyze.TickHandler;
 import com.zoosool.config.DerivAppConfig;
 
 import java.net.URI;
