@@ -1,4 +1,4 @@
-package com.zoosool.analyze;
+package com.zoosool.enums;
 
 public enum TickAction {
     TICK,

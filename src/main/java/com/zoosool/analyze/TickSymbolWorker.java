@@ -1,5 +1,6 @@
 package com.zoosool.analyze;
 
+import com.zoosool.enums.TickAction;
 import com.zoosool.model.TickEvent;
 
 import java.util.Objects;

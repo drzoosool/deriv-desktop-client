@@ -1,88 +1,55 @@
 package com.zoosool.analyze;
 
+import com.zoosool.enums.TickAction;
+import com.zoosool.enums.TickDecision;
+import com.zoosool.enums.TickStatsState;
 import com.zoosool.model.TickEvent;
+import com.zoosool.model.TickStatsSnapshot;
 
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Objects;
-import java.util.function.Consumer;
 
 /**
- * Calculates simple market "quality" stats for turbo options:
- * - ADL (Average Directional Length) for 120s and 30s windows
- * - Crossings count for MA(16) for 120s and 30s windows
- * - Zero-delta anomaly detection (ban when >= 2 within short window)
- * <p>
- * Notes:
- * - 1 tick == 1 second (as per your domain rule).
- * - For simplicity and correctness, metrics are recomputed from ring buffers periodically (each tick).
- * With window sizes 120/30, it's cheap and easier to debug.
- * - RESET clears all state. STOP just logs and returns.
+ * Calculates:
+ * - ADL (Average Directional Length) for L and S windows
+ * - MA crossings for L and S windows (MA length = MA_WINDOW)
+ * - zero-delta anomalies (ban if >= ZERO_DELTA_BAN_THRESHOLD in S window)
+ *
+ * Emission:
+ * - pushes TickStatsSnapshot to TickStatsSink every LOG_EVERY_SECONDS ticks (1 tick = 1 sec)
  */
 public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
-    // ====== Tunable parameters (static for now, easy to tweak) ======
-
-    /**
-     * Long window length in ticks (seconds).
-     */
+    // ====== Tuning knobs (static for now) ======
     public static final int LONG_WINDOW = 120;
-
-    /**
-     * Short window length in ticks (seconds).
-     */
     public static final int SHORT_WINDOW = 30;
-
-    /**
-     * Moving average window length in ticks (seconds).
-     */
     public static final int MA_WINDOW = 16;
 
-    /**
-     * Recompute & log cadence (seconds).
-     */
     public static final int LOG_EVERY_SECONDS = 2;
 
-    /**
-     * If >= this many zero deltas occur in the short window -> ban (abnormal mode).
-     */
     public static final int ZERO_DELTA_BAN_THRESHOLD = 2;
 
-    /**
-     * Thresholds for decision classification (initial placeholders, tweak later).
-     */
-    public static final double ADL_OK_LONG = 2.0;
-    public static final double ADL_OK_SHORT = 2.0;
-    public static final int XMA_BAD_SHORT = 8;  // e.g. too many MA crossings in 30s
-    public static final int XMA_BAD_LONG = 20;  // e.g. too many MA crossings in 120s
+    // Placeholder decision thresholds (tweak later)
+    public static final double ADL_OK_LONG = 2.2;
+    public static final double ADL_OK_SHORT = 2.2;
+    public static final int XMA_TRADE_SHORT_MAX = 4;
+    public static final int XMA_CAUTION_SHORT_MAX = 7;
+    public static final int XMA_LONG_MAX = 14;
 
     // ====== State ======
-
     private final String symbol;
-    private final Consumer<String> log;
+    private final TickStatsSink sink;
 
-    // ring buffer of quotes for the long window (also used as base for short window)
     private final double[] quotes = new double[LONG_WINDOW];
-    private int size = 0;      // filled samples, <= LONG_WINDOW
-    private int head = 0;      // next write position (0..LONG_WINDOW-1)
+    private int size = 0;
+    private int head = 0;
 
-    private Double lastQuote = null;
+    private int secondsSinceLastEmit = 0;
 
-    private int secondsSinceLastLog = 0;
-
-    public DefaultTickStatsCalculator(String symbol, Consumer<String> log) {
+    public DefaultTickStatsCalculator(String symbol, TickStatsSink sink) {
         this.symbol = Objects.requireNonNull(symbol, "symbol");
-        this.log = Objects.requireNonNull(log, "log");
-    }
-
-    @Override
-    public void onStart() {
-        log.accept("[STATS] symbol=" + symbol + " state=CALC_START");
-    }
-
-    @Override
-    public void onStop() {
-        log.accept("[STATS] symbol=" + symbol + " state=CALC_STOP");
+        this.sink = Objects.requireNonNull(sink, "sink");
     }
 
     @Override
@@ -91,32 +58,42 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
         if (event.action() == TickAction.RESET) {
             reset("RESET");
+            // optional: emit a warmup snapshot immediately after reset
+            sink.onSnapshot(new TickStatsSnapshot(
+                    symbol,
+                    TickStatsState.WARMUP_S,
+                    TickDecision.NA,
+                    LONG_WINDOW, SHORT_WINDOW, MA_WINDOW,
+                    0, 0,
+                    null, null,
+                    null, null,
+                    0,
+                    "RESET",
+                    Instant.now()
+            ));
             return;
         }
+
         if (event.action() == TickAction.STOP) {
-            // Nothing special: worker will stop after STOP, but we can log once.
-            log.accept("[STATS] symbol=" + symbol + " state=STOP_EVENT");
+            // worker will stop after STOP; no periodic emit required here
             return;
         }
+
         if (event.action() != TickAction.TICK) {
-            log.accept("[STATS] symbol=" + symbol + " state=IGNORED action=" + event.action());
             return;
         }
 
         Double qObj = event.quote();
         if (qObj == null || qObj.isNaN()) {
-            // Skip malformed tick
             return;
         }
 
-        double quote = qObj;
+        appendQuote(qObj);
 
-        appendQuote(quote);
-
-        secondsSinceLastLog++;
-        if (secondsSinceLastLog >= LOG_EVERY_SECONDS) {
-            secondsSinceLastLog = 0;
-            logSnapshot();
+        secondsSinceLastEmit++;
+        if (secondsSinceLastEmit >= LOG_EVERY_SECONDS) {
+            secondsSinceLastEmit = 0;
+            sink.onSnapshot(buildSnapshot());
         }
     }
 
@@ -124,32 +101,25 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         Arrays.fill(quotes, 0.0);
         size = 0;
         head = 0;
-        lastQuote = null;
-        secondsSinceLastLog = 0;
-
-        log.accept("[STATS] symbol=" + symbol + " state=RESET reason=" + reason + " at=" + Instant.now());
+        secondsSinceLastEmit = 0;
     }
 
     private void appendQuote(double quote) {
-        // write
         quotes[head] = quote;
         head = (head + 1) % LONG_WINDOW;
         if (size < LONG_WINDOW) {
             size++;
         }
-        lastQuote = quote;
     }
 
-    private void logSnapshot() {
+    private TickStatsSnapshot buildSnapshot() {
         int bufLong = size;
         int bufShort = Math.min(size, SHORT_WINDOW);
 
-        // Warming phases
         boolean hasMA = size >= MA_WINDOW;
         boolean hasShort = size >= SHORT_WINDOW;
         boolean hasLong = size >= LONG_WINDOW;
 
-        // Compute metrics (only when enough data; else NA)
         Double adlShort = hasShort ? computeAdl(bufShort) : null;
         Double adlLong = hasLong ? computeAdl(bufLong) : null;
 
@@ -158,44 +128,42 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
         int zeroShort = hasShort ? computeZeroDeltas(bufShort) : 0;
 
-        // Ban rule (abnormal mode)
         boolean banned = hasShort && zeroShort >= ZERO_DELTA_BAN_THRESHOLD;
 
-        String state = banned
-                ? "BANNED"
-                : (hasLong ? "OK" : (hasShort ? "WARMUP_L" : "WARMUP_S"));
+        TickStatsState state = banned
+                ? TickStatsState.BANNED
+                : (hasLong ? TickStatsState.OK : (hasShort ? TickStatsState.WARMUP_L : TickStatsState.WARMUP_S));
 
-        String decision = (banned || !hasLong)
-                ? "NA"
-                : classify(adlLong, xmaLong, adlShort, xmaShort);
+        TickDecision decision = (state == TickStatsState.OK)
+                ? classify(adlLong, xmaLong, adlShort, xmaShort)
+                : TickDecision.NA;
 
-        StringBuilder sb = new StringBuilder(256);
-        sb.append("[STATS] symbol=").append(symbol)
-                .append(" state=").append(state)
-                .append(" decision=").append(decision)
+        String reason = banned ? "ZERO_DELTA>=" + ZERO_DELTA_BAN_THRESHOLD : null;
 
-                .append(" adlL=").append(adlLong != null ? fmt2(adlLong) : "NA")
-                .append(" adlS=").append(adlShort != null ? fmt2(adlShort) : "NA")
-                .append(" xmaL=").append(xmaLong != null ? xmaLong : "NA")
-                .append(" xmaS=").append(xmaShort != null ? xmaShort : "NA")
-                .append(" zS=").append(hasShort ? zeroShort : 0);
-
-
-        sb.append(" L=").append(LONG_WINDOW)
-                .append(" S=").append(SHORT_WINDOW)
-                .append(" MA=").append(MA_WINDOW)
-                .append(" bufL=").append(bufLong).append("/").append(LONG_WINDOW)
-                .append(" bufS=").append(bufShort).append("/").append(SHORT_WINDOW);
-
-        if (banned) {
-            sb.append(" reason=ZERO_DELTA>= ").append(ZERO_DELTA_BAN_THRESHOLD);
-        }
-
-        log.accept(sb.toString());
+        return new TickStatsSnapshot(
+                symbol,
+                state,
+                decision,
+                LONG_WINDOW,
+                SHORT_WINDOW,
+                MA_WINDOW,
+                bufLong,
+                bufShort,
+                adlLong,
+                adlShort,
+                xmaLong,
+                xmaShort,
+                zeroShort,
+                reason,
+                Instant.now()
+        );
     }
 
+    /**
+     * ADL: average length of consecutive same-sign deltas within last windowSize quotes.
+     * - ignores delta==0 for run segmentation
+     */
     private double computeAdl(int windowSize) {
-        // Need at least 2 points
         if (windowSize < 2) return Double.NaN;
 
         int startIndex = indexOfOldest(windowSize);
@@ -203,7 +171,7 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         int runsCount = 0;
         int sumRunLengths = 0;
 
-        int currentSign = 0; // -1/+1, 0 means not started
+        int currentSign = 0;
         int currentLen = 0;
 
         double prev = quotes[startIndex];
@@ -216,7 +184,6 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
             int sign = Double.compare(d, 0.0);
             if (sign == 0) {
-                // ignore zero delta for ADL segmentation
                 continue;
             }
 
@@ -241,32 +208,29 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
             sumRunLengths += currentLen;
         }
 
-        if (runsCount == 0) {
-            // All deltas were zero (unlikely in your normal mode)
-            return 0.0;
-        }
-        return (double) sumRunLengths / (double) runsCount;
+        return runsCount == 0 ? 0.0 : (double) sumRunLengths / (double) runsCount;
     }
 
+    /**
+     * Crossings count between price and MA over last windowSize quotes.
+     * "Touch" (price==MA) does not flip side and does not count as crossing.
+     */
     private int computeMaCrossings(int windowSize) {
-        // Need at least MA_WINDOW to compute first MA, and 2 points to detect crossings.
         if (windowSize < Math.max(MA_WINDOW, 2)) return 0;
 
         int startIndex = indexOfOldest(windowSize);
 
         int crossings = 0;
+        Integer prevSide = null;
 
-        Integer prevSide = null; // sign of (price - ma) at previous tick
         for (int i = 0; i < windowSize; i++) {
             int idx = (startIndex + i) % LONG_WINDOW;
 
-            // MA for this tick uses MA_WINDOW ending at idx inclusive
             double ma = computeMaAt(idx);
             double price = quotes[idx];
 
             int side = Double.compare(price - ma, 0.0);
             if (side == 0) {
-                // Treat "touch" as neutral; keep prevSide unchanged to avoid fake crossings
                 continue;
             }
 
@@ -278,9 +242,6 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         return crossings;
     }
 
-    /**
-     * Counts the number of zero deltas (price unchanged) within last N quotes.
-     */
     private int computeZeroDeltas(int windowSize) {
         if (windowSize < 2) return 0;
 
@@ -300,7 +261,6 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
     }
 
     private double computeMaAt(int idxInclusive) {
-        // sum last MA_WINDOW quotes ending at idxInclusive
         double sum = 0.0;
         for (int k = 0; k < MA_WINDOW; k++) {
             int idx = idxInclusive - k;
@@ -320,16 +280,23 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         return idx;
     }
 
-    private static String fmt2(double v) {
-        return String.format(java.util.Locale.ROOT, "%.2f", v);
-    }
+    private static TickDecision classify(Double adlLong, Integer xmaLong, Double adlShort, Integer xmaShort) {
+        // Defensive: if something is missing, avoid TRADE
+        if (adlLong == null || adlShort == null || xmaLong == null || xmaShort == null) {
+            return TickDecision.NO_TRADE;
+        }
 
-    private static String classify(Double adlLong, Integer xmaLong, Double adlShort, Integer xmaShort) {
-        boolean longOk = adlLong != null && adlLong >= ADL_OK_LONG && xmaLong != null && xmaLong < XMA_BAD_LONG;
-        boolean shortOk = adlShort != null && adlShort >= ADL_OK_SHORT && xmaShort != null && xmaShort < XMA_BAD_SHORT;
+        boolean longOk = adlLong >= ADL_OK_LONG && xmaLong <= XMA_LONG_MAX;
 
-        if (longOk && shortOk) return "TRADE";
-        if (longOk) return "CAUTION";
-        return "NO_TRADE";
+        // Short window is the "now" signal for 6s trades
+        if (adlShort >= ADL_OK_SHORT && xmaShort <= XMA_TRADE_SHORT_MAX && longOk) {
+            return TickDecision.TRADE;
+        }
+
+        if (longOk && (adlShort >= 2.0 && xmaShort <= XMA_CAUTION_SHORT_MAX)) {
+            return TickDecision.CAUTION;
+        }
+
+        return TickDecision.NO_TRADE;
     }
 }

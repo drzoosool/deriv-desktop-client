@@ -1,14 +1,12 @@
 package com.zoosool;
 
-import com.zoosool.analyze.DefaultTickStatsCalculator;
-import com.zoosool.analyze.TickEventRouterService;
-import com.zoosool.analyze.TickHandler;
-import com.zoosool.analyze.TickStatsCalculatorFactory;
+import com.zoosool.analyze.*;
 import com.zoosool.config.DerivAppConfig;
 import com.zoosool.deriv.*;
 import com.zoosool.model.DerivSession;
 import com.zoosool.window.AppLogView;
 import com.zoosool.window.DerivClientMainWindow;
+import com.zoosool.window.TickStatsView;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.scene.Scene;
@@ -25,11 +23,11 @@ public class DerivDesktopClientApp extends Application {
 
     private DerivClientMainWindow derivClientMainWindow;
     private final AppLogView appLogView = new AppLogView();
+    private final TickStatsView statsView = new TickStatsView(Platform::runLater);
 
     private ExecutorService appIoExecutor;
     private ScheduledExecutorService pingScheduler;
 
-    // Tick stats routing/processing (per-symbol workers)
     private ExecutorService tickStatsExecutor;
     private TickEventRouterService tickEventRouterService;
 
@@ -53,7 +51,8 @@ public class DerivDesktopClientApp extends Application {
 
         tickStatsExecutor = Executors.newFixedThreadPool(5, newDaemonThreadFactory("tick-stats-"));
 
-        TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, appLogView.logger());
+        //LogSnapshot logSnapshot = new LogSnapshot(appLogView.logger());
+        TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, statsView);
 
         tickEventRouterService = new TickEventRouterService(
                 appLogView.logger(),
@@ -79,7 +78,7 @@ public class DerivDesktopClientApp extends Application {
         DerivTradingService trading = new DerivTradingService(connector, derivSession.currency());
         DerivController derivController = new DerivController(trading, appLogView.logger());
 
-        derivClientMainWindow = new DerivClientMainWindow(derivController, derivSession, appLogView);
+        derivClientMainWindow = new DerivClientMainWindow(derivController, derivSession, appLogView, statsView);
 
         pingScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "app-ping");
@@ -91,7 +90,7 @@ public class DerivDesktopClientApp extends Application {
     @Override
     public void start(Stage stage) {
         stage.setTitle("Deriv Desktop Client (MVP)");
-        stage.setScene(new Scene(derivClientMainWindow.getVisualArea(), 520, 620));
+        stage.setScene(new Scene(derivClientMainWindow.getVisualArea(), 520, 800));
         stage.setResizable(false);
         stage.setAlwaysOnTop(true);
         stage.show();

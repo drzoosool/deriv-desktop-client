@@ -22,7 +22,7 @@ public class DerivClientMainWindow {
     private final DerivOperations operations;
     private final AppLogView logView;
 
-    private final VBox visualArea = new VBox(12);
+    private final VBox visualArea = new VBox(10);
 
     private final TextField stakeField = new TextField();
 
@@ -36,12 +36,12 @@ public class DerivClientMainWindow {
 
     private static final String DURATION_UNIT = "t";
 
-    public DerivClientMainWindow(DerivOperations operations, DerivSession derivSession, AppLogView logView) {
+    public DerivClientMainWindow(DerivOperations operations, DerivSession derivSession, AppLogView logView, TickStatsView statsView) {
         this.operations = operations;
         this.logView = logView;
 
         // Root styling (dark background)
-        visualArea.setPadding(new Insets(16));
+        visualArea.setPadding(new Insets(14));
         visualArea.setStyle("""
                 -fx-background-color: #0f172a;
                 """);
@@ -91,7 +91,7 @@ public class DerivClientMainWindow {
 
         // Card container for form + actions
         VBox card = new VBox(12);
-        card.setPadding(new Insets(14));
+        card.setPadding(new Insets(12));
         card.setStyle("""
                 -fx-background-color: rgba(255,255,255,0.06);
                 -fx-background-radius: 16;
@@ -304,9 +304,8 @@ public class DerivClientMainWindow {
                 -fx-text-fill: white;
                 """);
 
-        // Assemble
         card.getChildren().addAll(cardTitle, form, buttons);
-        visualArea.getChildren().addAll(header, card, logPane);
+        visualArea.getChildren().addAll(header, statsView.getNode(), card, logPane);
     }
 
     public Parent getVisualArea() {
