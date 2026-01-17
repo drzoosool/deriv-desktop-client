@@ -25,6 +25,9 @@ public record TickStatsSnapshot(
         Integer xmaLong,  // null means NA
         Integer xmaShort, // null means NA
 
+        Double lastQuote, // last observed quote (nullable on RESET/WARMUP)
+        String lastQuoteString,
+
         int zeroShort,    // zS
 
         String reason,    // optional: ban/reset reason

@@ -17,7 +17,11 @@ import java.util.Objects;
  * - zero-delta anomalies (ban if >= ZERO_DELTA_BAN_THRESHOLD in S window)
  *
  * Emission:
- * - pushes TickStatsSnapshot to TickStatsSink every LOG_EVERY_SECONDS ticks (1 tick = 1 sec)
+ * - pushes TickStatsSnapshot to TickStatsSink every tick (1 tick = 1 sec)
+ *
+ * NOTE:
+ * Decision is intentionally NOT computed here anymore.
+ * It is computed downstream (or not used at all).
  */
 public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
@@ -26,16 +30,7 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
     public static final int SHORT_WINDOW = 30;
     public static final int MA_WINDOW = 16;
 
-    public static final int LOG_EVERY_SECONDS = 2;
-
     public static final int ZERO_DELTA_BAN_THRESHOLD = 2;
-
-    // Placeholder decision thresholds (tweak later)
-    public static final double ADL_OK_LONG = 2.2;
-    public static final double ADL_OK_SHORT = 2.2;
-    public static final int XMA_TRADE_SHORT_MAX = 4;
-    public static final int XMA_CAUTION_SHORT_MAX = 7;
-    public static final int XMA_LONG_MAX = 14;
 
     // ====== State ======
     private final String symbol;
@@ -45,7 +40,8 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
     private int size = 0;
     private int head = 0;
 
-    private int secondsSinceLastEmit = 0;
+    // Keep original quote text exactly as received (for UI / unique counting later)
+    private String lastQuoteText = null;
 
     public DefaultTickStatsCalculator(String symbol, TickStatsSink sink) {
         this.symbol = Objects.requireNonNull(symbol, "symbol");
@@ -57,8 +53,8 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         Objects.requireNonNull(event, "event");
 
         if (event.action() == TickAction.RESET) {
-            reset("RESET");
-            // optional: emit a warmup snapshot immediately after reset
+            reset();
+            // Emit warmup snapshot immediately after reset
             sink.onSnapshot(new TickStatsSnapshot(
                     symbol,
                     TickStatsState.WARMUP_S,
@@ -67,6 +63,8 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                     0, 0,
                     null, null,
                     null, null,
+                    null,            // lastQuote (Double)
+                    null,            // lastQuoteText (String)  <-- NEW
                     0,
                     "RESET",
                     Instant.now()
@@ -83,25 +81,42 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
             return;
         }
 
-        Double qObj = event.quote();
-        if (qObj == null || qObj.isNaN()) {
+        String qText = event.quote();
+        if (qText == null || qText.isBlank()) {
             return;
         }
 
-        appendQuote(qObj);
-
-        secondsSinceLastEmit++;
-        if (secondsSinceLastEmit >= LOG_EVERY_SECONDS) {
-            secondsSinceLastEmit = 0;
-            sink.onSnapshot(buildSnapshot());
+        double q;
+        try {
+            // Deriv uses dot as decimal separator; parse as-is.
+            q = Double.parseDouble(qText.trim());
+        } catch (NumberFormatException ex) {
+            // Ignore malformed values
+            return;
         }
+
+        if (Double.isNaN(q) || Double.isInfinite(q)) {
+            return;
+        }
+
+        // Store original text for snapshot (and future "unique values" logic)
+        lastQuoteText = qText;
+
+        appendQuote(q);
+
+        // Emit EVERY tick (1 tick = 1 sec)
+        sink.onSnapshot(buildSnapshot());
     }
 
-    private void reset(String reason) {
+    private void reset() {
         Arrays.fill(quotes, 0.0);
         size = 0;
         head = 0;
-        secondsSinceLastEmit = 0;
+        lastQuoteText = null;
+
+        if (sink instanceof Resetable) {
+            ((Resetable) sink).reset();
+        }
     }
 
     private void appendQuote(double quote) {
@@ -134,11 +149,12 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                 ? TickStatsState.BANNED
                 : (hasLong ? TickStatsState.OK : (hasShort ? TickStatsState.WARMUP_L : TickStatsState.WARMUP_S));
 
-        TickDecision decision = (state == TickStatsState.OK)
-                ? classify(adlLong, xmaLong, adlShort, xmaShort)
-                : TickDecision.NA;
+        TickDecision decision = TickDecision.NA;
 
         String reason = banned ? "ZERO_DELTA>=" + ZERO_DELTA_BAN_THRESHOLD : null;
+
+        Double lastQuote = (size > 0) ? lastQuote() : null;
+        String lastQuoteString= (size > 0) ? lastQuoteText : null;
 
         return new TickStatsSnapshot(
                 symbol,
@@ -153,10 +169,18 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                 adlShort,
                 xmaLong,
                 xmaShort,
+                lastQuote,
+                lastQuoteString,
                 zeroShort,
                 reason,
                 Instant.now()
         );
+    }
+
+    private double lastQuote() {
+        int idx = head - 1;
+        if (idx < 0) idx += LONG_WINDOW;
+        return quotes[idx];
     }
 
     /**
@@ -278,25 +302,5 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         int idx = oldestAll + skip;
         idx %= LONG_WINDOW;
         return idx;
-    }
-
-    private static TickDecision classify(Double adlLong, Integer xmaLong, Double adlShort, Integer xmaShort) {
-        // Defensive: if something is missing, avoid TRADE
-        if (adlLong == null || adlShort == null || xmaLong == null || xmaShort == null) {
-            return TickDecision.NO_TRADE;
-        }
-
-        boolean longOk = adlLong >= ADL_OK_LONG && xmaLong <= XMA_LONG_MAX;
-
-        // Short window is the "now" signal for 6s trades
-        if (adlShort >= ADL_OK_SHORT && xmaShort <= XMA_TRADE_SHORT_MAX && longOk) {
-            return TickDecision.TRADE;
-        }
-
-        if (longOk && (adlShort >= 2.0 && xmaShort <= XMA_CAUTION_SHORT_MAX)) {
-            return TickDecision.CAUTION;
-        }
-
-        return TickDecision.NO_TRADE;
     }
 }

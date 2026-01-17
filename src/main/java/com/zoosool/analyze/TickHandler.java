@@ -1,6 +1,7 @@
 package com.zoosool.analyze;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.zoosool.utils.NumberStringUtils;
 
 import java.time.Instant;
 import java.util.Objects;
@@ -21,11 +22,22 @@ public final class TickHandler {
 
         JsonNode tick = message.path("tick");
         String symbol = textOrNull(tick.get("symbol"));
-        double quote = tick.path("quote").asDouble(Double.NaN);
-
-        if (symbol != null && !Double.isNaN(quote)) {
-            router.onTick(symbol, quote);
+        if (symbol == null || symbol.isBlank()) {
+            return;
         }
+
+        JsonNode quoteNode = tick.get("quote");
+        if (quoteNode == null || quoteNode.isNull()) {
+            return;
+        }
+
+        // Take quote as raw text to avoid double precision artifacts.
+        String quoteText = quoteNode.asText(null);
+        if (quoteText == null || quoteText.isBlank()) {
+            return;
+        }
+
+        router.onTick(symbol, quoteText);
     }
 
     public void onReconnect(String reason) {

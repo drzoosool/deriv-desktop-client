@@ -35,7 +35,7 @@ public final class TickEventRouterService {
         this.queueCapacity = queueCapacity;
     }
 
-    public void onTick(String symbol, double quote) {
+    public void onTick(String symbol, String quote) {
         WorkerContext ctx = getOrCreateWorker(symbol);
 
         TickEvent event = TickEvent.tick(symbol, quote);

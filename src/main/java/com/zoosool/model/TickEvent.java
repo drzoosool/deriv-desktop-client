@@ -12,8 +12,8 @@ import java.util.Objects;
 public record TickEvent(
         String symbol,
         TickAction action,
-        Double quote,          // null for RESET/STOP if you want
-        Instant receivedAt     // for logging/debug; optional
+        String quote,
+        Instant receivedAt
 ) {
     public TickEvent {
         Objects.requireNonNull(symbol, "symbol");
@@ -21,7 +21,7 @@ public record TickEvent(
         Objects.requireNonNull(receivedAt, "receivedAt");
     }
 
-    public static TickEvent tick(String symbol, double quote) {
+    public static TickEvent tick(String symbol, String quote) {
         return new TickEvent(symbol, TickAction.TICK, quote, Instant.now());
     }
 

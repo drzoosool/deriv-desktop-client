@@ -1,5 +1,6 @@
 package com.zoosool.window;
 
+import com.zoosool.analyze.Resetable;
 import com.zoosool.analyze.TickStatsSink;
 import com.zoosool.enums.TickDecision;
 import com.zoosool.enums.TickStatsState;
@@ -24,7 +25,7 @@ import java.util.function.Consumer;
  * Rows are kept sorted alphabetically by symbol.
  * Updates are thread-safe via uiExecutor (Platform::runLater).
  */
-public final class TickStatsView implements TickStatsSink {
+public final class TickStatsView implements TickStatsSink, Resetable {
 
     private final Consumer<Runnable> ui;
 
@@ -168,6 +169,11 @@ public final class TickStatsView implements TickStatsSink {
                 -fx-font-weight: 700;
                 """);
         return l;
+    }
+
+    @Override
+    public void reset() {
+        rowsBySymbol.clear();
     }
 
     private final class RowUi {

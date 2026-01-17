@@ -11,15 +11,12 @@ import java.util.concurrent.CompletableFuture;
 public class DerivTradingService {
 
     private final ObjectMapper mapper = new ObjectMapper();
-    private final DerivConnector connector;
-    private final String currency;
+    private final DerivConnectorHolder connectorHolder;
+    private final DerivCurrencyHolder derivCurrencyHolder;
 
-    public DerivTradingService(DerivConnector connector, String currency) {
-        this.connector = Objects.requireNonNull(connector, "connector");
-        if (currency == null || currency.isBlank()) {
-            throw new IllegalArgumentException("currency is blank");
-        }
-        this.currency = currency;
+    public DerivTradingService(DerivConnectorHolder connectorHolder, DerivCurrencyHolder derivCurrencyHolder) {
+        this.connectorHolder = Objects.requireNonNull(connectorHolder, "connectorHolder");
+        this.derivCurrencyHolder = Objects.requireNonNull(derivCurrencyHolder, "derivCurrencyHolder");
     }
 
     public CompletableFuture<Long> buyRise(Contract contract) {
@@ -37,13 +34,21 @@ public class DerivTradingService {
     }
 
     private CompletableFuture<Long> buy(String contractType, Contract contract) {
+        if (derivCurrencyHolder.getCurrency().isEmpty()) {
+            throw new IllegalStateException("Currency not set");
+        }
+
+        if (connectorHolder.getConnector().isEmpty()) {
+            throw new IllegalStateException("Deriv connector not set");
+        }
+
         Objects.requireNonNull(contract, "contract");
 
         ObjectNode params = mapper.createObjectNode();
         params.put("amount", contract.stake());
         params.put("basis", contract.basis());
         params.put("contract_type", contractType);
-        params.put("currency", currency);
+        params.put("currency", derivCurrencyHolder.getCurrency().get());
         params.put("duration", contract.durationTicks());
         params.put("duration_unit", contract.durationUnit());
         params.put("symbol", contract.symbol());
@@ -54,7 +59,7 @@ public class DerivTradingService {
         buy.set("parameters", params);
 
         // Trading does not reconnect. It relies on connector state.
-        return connector.sendRequest(buy).thenApply(this::extractContractId);
+        return connectorHolder.getConnector().get().sendRequest(buy).thenApply(this::extractContractId);
     }
 
     private long extractContractId(JsonNode resp) {

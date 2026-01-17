@@ -51,8 +51,12 @@ public class DerivDesktopClientApp extends Application {
 
         tickStatsExecutor = Executors.newFixedThreadPool(5, newDaemonThreadFactory("tick-stats-"));
 
-        //LogSnapshot logSnapshot = new LogSnapshot(appLogView.logger());
-        TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, statsView);
+        DerivCurrencyHolder derivCurrencyHolder = new DerivCurrencyHolder();
+        DerivConnectorHolder derivConnectorHolder = new DerivConnectorHolder();
+        DerivTradingService trading = new DerivTradingService(derivConnectorHolder, derivCurrencyHolder);
+        NoFilterTradeDecisionMaker noFilterTradeDecisionMaker = new NoFilterTradeDecisionMaker(trading);
+        TickDecisionEngineSink tickDecisionEngineSink = new TickDecisionEngineSink(statsView, noFilterTradeDecisionMaker);
+        TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, tickDecisionEngineSink);
 
         tickEventRouterService = new TickEventRouterService(
                 appLogView.logger(),
@@ -73,11 +77,12 @@ public class DerivDesktopClientApp extends Application {
                 derivTickSubscriptionsService
         );
 
+
         DerivSession derivSession = connector.ping().join();
+        derivCurrencyHolder.setCurrency(derivSession.currency());
+        derivConnectorHolder.setConnector(connector);
 
-        DerivTradingService trading = new DerivTradingService(connector, derivSession.currency());
         DerivController derivController = new DerivController(trading, appLogView.logger());
-
         derivClientMainWindow = new DerivClientMainWindow(derivController, derivSession, appLogView, statsView);
 
         pingScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
