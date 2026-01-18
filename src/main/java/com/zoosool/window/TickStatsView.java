@@ -24,6 +24,11 @@ import java.util.function.Consumer;
  * One row per symbol. Columns are aligned to window width (percent widths).
  * Rows are kept sorted alphabetically by symbol.
  * Updates are thread-safe via uiExecutor (Platform::runLater).
+ *
+ * Reset behavior:
+ * - Does NOT remove rows from UI.
+ * - Only clears per-row values to placeholders.
+ * This avoids "UI disappears on disconnect" and removes the need for reset dedup logic.
  */
 public final class TickStatsView implements TickStatsSink, Resetable {
 
@@ -127,15 +132,6 @@ public final class TickStatsView implements TickStatsSink, Resetable {
         root.getChildren().addAll(title, header, rowsBox);
     }
 
-    /**
-     * Grid row with percent-based columns:
-     * 0 Symbol   = 24%
-     * 1 State    = 16%
-     * 2 Decision = 16%
-     * 3 ADL      = 18%
-     * 4 XMA      = 18%
-     * 5 zS       = 8%
-     */
     private static GridPane createGridRow() {
         GridPane g = new GridPane();
         g.setHgap(8);
@@ -171,9 +167,24 @@ public final class TickStatsView implements TickStatsSink, Resetable {
         return l;
     }
 
+    /**
+     * Reset = clear values only (keep rows).
+     * This prevents "only last row left" effects during reconnect storms.
+     */
     @Override
     public void reset() {
-        rowsBySymbol.clear();
+        ui.accept(() -> rowsBySymbol.values().forEach(RowUi::clearValues));
+    }
+
+    /**
+     * If you ever truly need a full wipe (e.g., symbol list changed),
+     * call this explicitly from connector/controller, NOT from per-symbol calculators.
+     */
+    public void clearAllRows() {
+        ui.accept(() -> {
+            rowsBySymbol.clear();
+            rowsBox.getChildren().clear();
+        });
     }
 
     private final class RowUi {
@@ -193,7 +204,7 @@ public final class TickStatsView implements TickStatsSink, Resetable {
 
             grid.setPadding(new Insets(3, 6, 3, 6));
             grid.setStyle(rowStyleNormal());
-            grid.setUserData(this.symbolText); // used for sorting/insertion
+            grid.setUserData(this.symbolText);
 
             symbol.setText(this.symbolText);
 
@@ -226,6 +237,16 @@ public final class TickStatsView implements TickStatsSink, Resetable {
             zS.setText(Integer.toString(s.zeroShort()));
 
             grid.setStyle(s.state() == TickStatsState.BANNED ? rowStyleBanned() : rowStyleNormal());
+        }
+
+        void clearValues() {
+            // Keep symbol text, clear everything else.
+            setBadge(state, "—", "rgba(255,255,255,0.10)");
+            setBadge(decision, "—", "rgba(255,255,255,0.10)");
+            adl.setText("NA/NA");
+            xma.setText("NA/NA");
+            zS.setText("0");
+            grid.setStyle(rowStyleNormal());
         }
     }
 

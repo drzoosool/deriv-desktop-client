@@ -23,6 +23,7 @@ public class DerivWsClient extends WebSocketClient {
     private final AtomicInteger reqSeq = new AtomicInteger(1);
     private final Map<Integer, CompletableFuture<JsonNode>> pending = new ConcurrentHashMap<>();
     private final TickHandler tickHandler;
+    private final BalanceHandler balanceHandler;
 
     private final String token;
     private final Consumer<String> log;
@@ -35,8 +36,9 @@ public class DerivWsClient extends WebSocketClient {
      */
     private volatile BiConsumer<String, Exception> disconnectListener;
 
-    public DerivWsClient(URI serverUri, String token, Consumer<String> log, TickHandler tickHandler) {
+    public DerivWsClient(URI serverUri, String token, Consumer<String> log, TickHandler tickHandler, BalanceHandler balanceHandler) {
         super(serverUri);
+        this.balanceHandler = balanceHandler;
         if (token == null || token.isBlank()) {
             throw new IllegalArgumentException("Deriv token must not be blank");
         }
@@ -95,12 +97,16 @@ public class DerivWsClient extends WebSocketClient {
 
             // 2) Handle pushes
             if ("pong".equals(msgType)) {
-                // Usually too noisy; ignore by default.
                 return;
             }
 
             if ("tick".equals(msgType)) {
                 tickHandler.onTick(node);
+                return;
+            }
+
+            if ("balance".equals(msgType)) {
+                balanceHandler.onBalance(node);
                 return;
             }
 
@@ -115,6 +121,7 @@ public class DerivWsClient extends WebSocketClient {
             log("❗ parse error: " + ex.getMessage());
         }
     }
+
 
     @Override
     public void onClose(int code, String reason, boolean remote) {

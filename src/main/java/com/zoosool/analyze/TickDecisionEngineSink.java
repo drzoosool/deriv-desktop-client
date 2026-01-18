@@ -39,7 +39,6 @@ public final class TickDecisionEngineSink implements TickStatsSink, Resetable {
     public void onSnapshot(TickStatsSnapshot snapshot) {
         Objects.requireNonNull(snapshot, "snapshot");
 
-        // Read values first. If all are missing -> do not create per-symbol state.
         String quoteString = snapshot.lastQuoteString();
         Integer xmaS = snapshot.xmaShort();
         Double adlS = snapshot.adlShort();
@@ -50,10 +49,7 @@ public final class TickDecisionEngineSink implements TickStatsSink, Resetable {
 
         AnalyzeContainer st = null;
         if (hasQuote || hasXma || hasAdl) {
-            st = bySymbol.computeIfAbsent(
-                    snapshot.symbol(),
-                    s -> new AnalyzeContainer(DEFAULT_WINDOW)
-            );
+            st = bySymbol.computeIfAbsent(snapshot.symbol(), s -> new AnalyzeContainer(DEFAULT_WINDOW));
 
             // 1) price level buffer (from original quote text)
             if (hasQuote) {

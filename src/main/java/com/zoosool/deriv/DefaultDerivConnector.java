@@ -23,7 +23,9 @@ public final class DefaultDerivConnector implements DerivConnector {
     private final ConnectionStateController state;
     private final Executor connectExecutor;
     private final DerivTickSubscriptionsService tickSubscriptions;
+    private final DerivBalanceSubscriptionsService derivBalanceSubscriptionsService;
     private final TickHandler tickHandler;
+    private final BalanceHandler balanceHandler;
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final Object swapLock = new Object();
@@ -39,7 +41,9 @@ public final class DefaultDerivConnector implements DerivConnector {
             ConnectionStateController state,
             Executor connectExecutor,
             TickHandler tickHandler,
-            DerivTickSubscriptionsService tickSubscriptions
+            DerivTickSubscriptionsService tickSubscriptions,
+            DerivBalanceSubscriptionsService derivBalanceSubscriptionsService,
+            BalanceHandler balanceHandler
     ) {
         this.cfg = Objects.requireNonNull(cfg, "cfg");
         this.log = Objects.requireNonNull(log, "log");
@@ -47,6 +51,8 @@ public final class DefaultDerivConnector implements DerivConnector {
         this.connectExecutor = Objects.requireNonNull(connectExecutor, "connectExecutor");
         this.tickHandler = Objects.requireNonNull(tickHandler, "tickHandler");
         this.tickSubscriptions = Objects.requireNonNull(tickSubscriptions, "tickSubscriptions");
+        this.balanceHandler = Objects.requireNonNull(balanceHandler, "balanceHandler");
+        this.derivBalanceSubscriptionsService = derivBalanceSubscriptionsService;
     }
 
     @Override
@@ -112,7 +118,7 @@ public final class DefaultDerivConnector implements DerivConnector {
                 f.completeExceptionally(new IllegalStateException("Connector is CLOSED"));
                 return;
             }
-            wsLocal = DerivWebSocketClientFactory.getClient(cfg, log, tickHandler);
+            wsLocal = DerivWebSocketClientFactory.getClient(cfg, log, tickHandler, balanceHandler);
         } catch (Throwable ex) {
             connectingFuture = null;
             if (state.get() != ConnectionState.CLOSED) {
@@ -142,6 +148,7 @@ public final class DefaultDerivConnector implements DerivConnector {
             tickHandler.onReconnect("connect/new-session");
 
             tickSubscriptions.subscribeAll(wsLocal, newSession.stepIndices()).join();
+            derivBalanceSubscriptionsService.subscribe(wsLocal).join();
 
             DerivWsClient oldWs;
             synchronized (swapLock) {

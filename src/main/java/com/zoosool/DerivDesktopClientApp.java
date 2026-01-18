@@ -53,8 +53,9 @@ public class DerivDesktopClientApp extends Application {
 
         DerivCurrencyHolder derivCurrencyHolder = new DerivCurrencyHolder();
         DerivConnectorHolder derivConnectorHolder = new DerivConnectorHolder();
+        BalanceHolder balanceHolder = new BalanceHolder();
         DerivTradingService trading = new DerivTradingService(derivConnectorHolder, derivCurrencyHolder);
-        NoFilterTradeDecisionMaker noFilterTradeDecisionMaker = new NoFilterTradeDecisionMaker(trading);
+        NoFilterTradeDecisionMaker noFilterTradeDecisionMaker = new NoFilterTradeDecisionMaker(trading, appLogView.logger());
         TickDecisionEngineSink tickDecisionEngineSink = new TickDecisionEngineSink(statsView, noFilterTradeDecisionMaker);
         TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, tickDecisionEngineSink);
 
@@ -66,7 +67,9 @@ public class DerivDesktopClientApp extends Application {
         );
 
         TickHandler tickHandler = new TickHandler(appLogView.logger(), tickEventRouterService);
+        BalanceHandler balanceHandler = new BalanceHandler(balanceHolder, appLogView.logger());
         DerivTickSubscriptionsService derivTickSubscriptionsService = new DerivTickSubscriptionsService(appLogView.logger());
+        DerivBalanceSubscriptionsService derivBalanceSubscriptionsService = new DerivBalanceSubscriptionsService(appLogView.logger());
 
         connector = new DefaultDerivConnector(
                 cfg,
@@ -74,7 +77,9 @@ public class DerivDesktopClientApp extends Application {
                 state,
                 appIoExecutor,
                 tickHandler,
-                derivTickSubscriptionsService
+                derivTickSubscriptionsService,
+                derivBalanceSubscriptionsService,
+                balanceHandler
         );
 
 
