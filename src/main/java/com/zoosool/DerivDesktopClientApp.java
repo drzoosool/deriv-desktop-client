@@ -55,7 +55,7 @@ public class DerivDesktopClientApp extends Application {
         DerivConnectorHolder derivConnectorHolder = new DerivConnectorHolder();
         BalanceHolder balanceHolder = new BalanceHolder();
         DerivTradingService trading = new DerivTradingService(derivConnectorHolder, derivCurrencyHolder);
-        NoFilterTradeDecisionMaker noFilterTradeDecisionMaker = new NoFilterTradeDecisionMaker(trading, appLogView.logger());
+        NoFilterTradeDecisionMaker noFilterTradeDecisionMaker = new NoFilterTradeDecisionMaker(trading, balanceHolder, appLogView.logger());
         TickDecisionEngineSink tickDecisionEngineSink = new TickDecisionEngineSink(statsView, noFilterTradeDecisionMaker);
         TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, tickDecisionEngineSink);
 

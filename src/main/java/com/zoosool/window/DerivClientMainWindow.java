@@ -27,14 +27,15 @@ public class DerivClientMainWindow {
     private final TextField stakeField = new TextField();
 
     private final ComboBox<ActiveSymbol> selectorCurrentAsset = new ComboBox<>();
-    private final ComboBox<Integer> selectorDurationTicks = new ComboBox<>(observableArrayList(2, 4, 6, 8, 10));
+    private final ComboBox<Integer> selectorDurationTicks = new ComboBox<>(observableArrayList(2, 4, 6, 8, 10, 15, 17, 19));
     private final ComboBox<String> selectorBasis = new ComboBox<>(observableArrayList("payout", "stake"));
 
     private final Button buyButton = new Button("BUY");
     private final Button sellButton = new Button("SELL");
     private final Button buySellButton = new Button("BUY/SELL");
 
-    private static final String DURATION_UNIT = "t";
+    private static final String DURATION_UNIT_T = "t";
+    private static final String DURATION_UNIT_S = "s";
 
     public DerivClientMainWindow(DerivOperations operations, DerivSession derivSession, AppLogView logView, TickStatsView statsView) {
         this.operations = operations;
@@ -233,7 +234,7 @@ public class DerivClientMainWindow {
                     asset.symbol(),
                     stake,
                     selectorDurationTicks.getValue(),
-                    DURATION_UNIT,
+                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
                     selectorBasis.getValue()
             ));
 
@@ -256,7 +257,7 @@ public class DerivClientMainWindow {
                     asset.symbol(),
                     stake,
                     selectorDurationTicks.getValue(),
-                    DURATION_UNIT,
+                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
                     selectorBasis.getValue()
             ));
 
@@ -279,7 +280,7 @@ public class DerivClientMainWindow {
                     asset.symbol(),
                     stake,
                     selectorDurationTicks.getValue(),
-                    DURATION_UNIT,
+                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
                     selectorBasis.getValue()
             ));
 

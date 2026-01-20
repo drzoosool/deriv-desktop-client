@@ -21,8 +21,6 @@ public class DerivTradingService {
     private final DerivConnectorHolder connectorHolder;
     private final DerivCurrencyHolder derivCurrencyHolder;
 
-    // Single thread is enough: polling is very light.
-    // IMPORTANT: you should shutdown it in Application.stop() / container registry.
     private final ScheduledExecutorService statusPoller =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "deriv-contract-status-poller");

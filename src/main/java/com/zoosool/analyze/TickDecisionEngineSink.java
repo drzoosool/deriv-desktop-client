@@ -8,23 +8,18 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Extension point for decision/analysis experiments.
+ * Maintains per-symbol AnalyzeContainer:
+ * - levels (from lastQuoteString)
+ * - xmaShort/xmaLong
+ * - adlShort/adlLong (scaled)
+ * - zeroShort
  *
- * Current responsibility:
- * - Maintain per-symbol ring buffers (last N):
- *   - price levels (as long, derived from original quote text)
- *   - xmaShort (as long)
- *   - adlShort (scaled to long)
- * - Once levels buffer is full, try to infer tick step (delta between levels).
- * - Forward snapshots downstream without modification (pass-through).
- *
- * Important:
- * - AnalyzeContainer is created ONLY when there is at least one non-null metric to store.
- *   This avoids creating empty containers on RESET snapshots.
+ * Then calls TradeDecisionMaker with the container.
+ * Pass-through snapshots to UI unchanged.
  */
 public final class TickDecisionEngineSink implements TickStatsSink, Resetable {
 
-    private static final int DEFAULT_WINDOW = 10;
+    private static final int DEFAULT_WINDOW = 14;
 
     private final TickStatsSink downstream;
     private final TradeDecisionMaker tradeDecisionMaker;
@@ -32,51 +27,62 @@ public final class TickDecisionEngineSink implements TickStatsSink, Resetable {
 
     public TickDecisionEngineSink(TickStatsSink downstream, TradeDecisionMaker tradeDecisionMaker) {
         this.downstream = Objects.requireNonNull(downstream, "downstream");
-        this.tradeDecisionMaker = tradeDecisionMaker;
+        this.tradeDecisionMaker = Objects.requireNonNull(tradeDecisionMaker, "tradeDecisionMaker");
     }
 
     @Override
     public void onSnapshot(TickStatsSnapshot snapshot) {
         Objects.requireNonNull(snapshot, "snapshot");
 
+        String symbol = snapshot.symbol();
+
         String quoteString = snapshot.lastQuoteString();
         Integer xmaS = snapshot.xmaShort();
+        Integer xmaL = snapshot.xmaLong();
         Double adlS = snapshot.adlShort();
+        Double adlL = snapshot.adlLong();
+        int zS = snapshot.zeroShort();
 
         boolean hasQuote = quoteString != null && !quoteString.isBlank();
-        boolean hasXma = xmaS != null;
-        boolean hasAdl = adlS != null && !adlS.isNaN() && !adlS.isInfinite();
+        boolean hasXmaS = xmaS != null;
+        boolean hasXmaL = xmaL != null;
+        boolean hasAdlS = adlS != null && !adlS.isNaN() && !adlS.isInfinite();
+        boolean hasAdlL = adlL != null && !adlL.isNaN() && !adlL.isInfinite();
+
+        // We want container if ANY useful data can be stored.
+        // zeroShort is always available => we can always store it (cheap) but avoid creating on RESET if you want.
+        boolean shouldCreate =
+                hasQuote || hasXmaS || hasXmaL || hasAdlS || hasAdlL;
 
         AnalyzeContainer st = null;
-        if (hasQuote || hasXma || hasAdl) {
-            st = bySymbol.computeIfAbsent(snapshot.symbol(), s -> new AnalyzeContainer(DEFAULT_WINDOW));
+        if (shouldCreate) {
+            st = bySymbol.computeIfAbsent(symbol, s -> new AnalyzeContainer(DEFAULT_WINDOW));
 
-            // 1) price level buffer (from original quote text)
+            st.onSnapshotAt(snapshot.at());
+
             if (hasQuote) {
                 try {
                     long level = NumberStringUtils.toLongByConcatDroppingTrailingZeros(quoteString);
                     st.onLevel(level);
                 } catch (RuntimeException ignoreBadQuote) {
-                    // Skip malformed quote formats; do not poison the state.
+                    // Skip malformed quote formats.
                 }
             }
 
-            // 2) short-window MA crossings buffer
-            if (hasXma) {
-                st.onXmaShort(xmaS);
-            }
+            if (hasXmaS) st.onXmaShort(xmaS);
+            if (hasXmaL) st.onXmaLong(xmaL);
 
-            // 3) short-window ADL buffer (scaled)
-            if (hasAdl) {
-                st.onAdlShort(adlS);
-            }
+            if (hasAdlS) st.onAdlShort(adlS);
+            if (hasAdlL) st.onAdlLong(adlL);
+
+            // Even if other metrics exist, store zS as well.
+            st.onZeroShort(zS);
         }
 
         if (st != null) {
-            tradeDecisionMaker.decideAndTrade(snapshot.symbol(), st);
+            tradeDecisionMaker.decideAndTrade(symbol, st);
         }
 
-        // Pass-through to UI unchanged
         downstream.onSnapshot(snapshot);
     }
 

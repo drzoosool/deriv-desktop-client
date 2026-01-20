@@ -110,12 +110,12 @@ public class DerivWsClient extends WebSocketClient {
                 return;
             }
 
-            // 3) Log other push messages to understand the stream
-            if (!msgType.isBlank()) {
-                log("📩 PUSH msg_type=" + msgType + " raw=" + compactJson(node));
-            } else {
-                log("📩 PUSH without msg_type raw=" + compactJson(node));
-            }
+//            // 3) Log other push messages to understand the stream
+//            if (!msgType.isBlank()) {
+//                log("📩 PUSH msg_type=" + msgType + " raw=" + compactJson(node));
+//            } else {
+//                log("📩 PUSH without msg_type raw=" + compactJson(node));
+//            }
 
         } catch (Exception ex) {
             log("❗ parse error: " + ex.getMessage());
