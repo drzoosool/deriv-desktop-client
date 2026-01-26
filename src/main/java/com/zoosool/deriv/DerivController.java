@@ -45,6 +45,16 @@ public class DerivController implements DerivOperations {
                 });
     }
 
+    @Override
+    public void buySellS(Contract contract) {
+        trading.buyBoth(contract, true)
+                .thenRun(() -> log.accept("BUY+DOWN SMART sent"))
+                .exceptionally(ex -> {
+                    log.accept("BUY+DOWN FAIL: " + rootMessage(ex));
+                    return null;
+                });
+    }
+
     private static String rootMessage(Throwable t) {
         Throwable cur = t;
         while (cur.getCause() != null) cur = cur.getCause();

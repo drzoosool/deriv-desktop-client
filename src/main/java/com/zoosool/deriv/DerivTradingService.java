@@ -5,166 +5,355 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.zoosool.model.Contract;
 
-import java.time.Duration;
-import java.time.Instant;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
-public class DerivTradingService {
+public final class DerivTradingService {
 
-    private static final Duration DEFAULT_WAIT_TIMEOUT = Duration.ofSeconds(30);
-    private static final Duration DEFAULT_POLL_INTERVAL = Duration.ofMillis(250);
+    // Await-mode polling cadence.
+    private static final long AWAIT_POLL_PERIOD_MILLIS = 1_000;
+
+    // 10 minutes fail-safe.
+    private static final long AWAIT_TIMEOUT_MILLIS = 10 * 60_000L;
+
+    // If await timed out, retry polling (same contract ids) after small delay.
+    private static final long AWAIT_RETRY_DELAY_MILLIS = 1_000;
 
     private final ObjectMapper mapper = new ObjectMapper();
+
     private final DerivConnectorHolder connectorHolder;
     private final DerivCurrencyHolder derivCurrencyHolder;
+    private final Consumer<String> log;
 
-    private final ScheduledExecutorService statusPoller =
-            Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "deriv-contract-status-poller");
-                t.setDaemon(true);
-                return t;
-            });
+    private final ScheduledExecutorService poller;
+    private final AtomicInteger reqSeq = new AtomicInteger(1);
 
-    public DerivTradingService(DerivConnectorHolder connectorHolder, DerivCurrencyHolder derivCurrencyHolder) {
+    public DerivTradingService(
+            DerivConnectorHolder connectorHolder,
+            DerivCurrencyHolder derivCurrencyHolder,
+            Consumer<String> logger
+    ) {
         this.connectorHolder = Objects.requireNonNull(connectorHolder, "connectorHolder");
         this.derivCurrencyHolder = Objects.requireNonNull(derivCurrencyHolder, "derivCurrencyHolder");
+        this.log = Objects.requireNonNull(logger, "logger");
+
+        this.poller = new ScheduledThreadPoolExecutor(1, r -> {
+            Thread t = new Thread(r, "deriv-contract-poller");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    // Kept: backward-compatible behavior (buys CALL + PUT, does not await).
+    public CompletableFuture<Void> buyBoth(Contract contract) {
+        return buyBoth(contract, false);
+    }
+
+    /**
+     * Kept for compatibility. "hold" is no longer used (subscriptions/holder removed),
+     * but the signature stays so existing callers compile.
+     *
+     * Behavior:
+     * - buys CALL and PUT
+     * - returns when both BUY acks received (ids are obtained)
+     */
+    public CompletableFuture<Void> buyBoth(Contract contract, boolean hold) {
+        Objects.requireNonNull(contract, "contract");
+
+        CompletableFuture<Long> up = buyRise(contract);
+        CompletableFuture<Long> down = buyFall(contract);
+
+        return up.thenCombine(down, (a, b) -> null);
+    }
+
+    public void shutdown() {
+        poller.shutdownNow();
     }
 
     public CompletableFuture<Long> buyRise(Contract contract) {
-        return buy("CALL", contract);
+        return buyAck("CALL", contract).thenApply(BuyAck::contractId);
     }
 
     public CompletableFuture<Long> buyFall(Contract contract) {
-        return buy("PUT", contract);
+        return buyAck("PUT", contract).thenApply(BuyAck::contractId);
     }
 
-    public CompletableFuture<Void> buyBoth(Contract contract) {
-        CompletableFuture<Long> up = buyRise(contract);
-        CompletableFuture<Long> down = buyFall(contract);
-        return CompletableFuture.allOf(up, down);
-    }
+    public enum BuySellResult { SUCCESS, FAIL }
 
     /**
-     * Buys both sides and asynchronously waits until BOTH contracts are closed.
-     * No blocking here. Caller can attach thenAccept / whenComplete.
+     * BUY CALL + BUY PUT, then poll both via proposal_open_contract (no subscriptions),
+     * until both are is_sold==1.
+     *
+     * SUCCESS: (profit(call) > 0) OR (profit(put) > 0)
+     * FAIL: both profits <= 0
+     *
+     * If polling times out, it retries polling (same contract ids) until it succeeds.
+     * It does NOT re-buy contracts.
      */
-    public CompletableFuture<BothBuyStatus> buyBothAndWaitAsync(Contract contract) {
-        CompletableFuture<Long> upF = buyRise(contract);
-        CompletableFuture<Long> downF = buyFall(contract);
+    public CompletableFuture<BuySellResult> buySellAndAwait(Contract contract) {
+        Objects.requireNonNull(contract, "contract");
 
-        return upF.thenCombine(downF, (upId, downId) -> new long[]{upId, downId})
-                .thenCompose(ids -> {
-                    long upId = ids[0];
-                    long downId = ids[1];
+        CompletableFuture<Long> callF = buyRise(contract);
+        CompletableFuture<Long> putF  = buyFall(contract);
 
-                    CompletableFuture<ContractOutcome> upClosed =
-                            waitUntilClosedByPolling(upId, DEFAULT_WAIT_TIMEOUT, DEFAULT_POLL_INTERVAL);
+        return callF.thenCombine(putF, (callId, putId) -> new long[]{callId, putId})
+                .thenCompose(ids -> awaitBothSoldRetryForever(contract.symbol(), ids[0], ids[1]));
+    }
 
-                    CompletableFuture<ContractOutcome> downClosed =
-                            waitUntilClosedByPolling(downId, DEFAULT_WAIT_TIMEOUT, DEFAULT_POLL_INTERVAL);
+    private CompletableFuture<BuySellResult> awaitBothSoldRetryForever(String symbol, long callId, long putId) {
+        CompletableFuture<BuySellResult> out = new CompletableFuture<>();
+        awaitAttempt(symbol, callId, putId, out);
+        return out;
+    }
 
-                    return upClosed.thenCombine(downClosed, (up, down) ->
-                            new BothBuyStatus(up.contractId(), down.contractId(), up, down, Instant.now())
-                    );
+    private void awaitAttempt(String symbol, long callId, long putId, CompletableFuture<BuySellResult> out) {
+        if (out.isDone()) return;
+
+        awaitBothSold(symbol, callId, putId).whenComplete((res, ex) -> {
+            if (ex == null) {
+                out.complete(res);
+                return;
+            }
+
+            Throwable t = unwrapCompletionException(ex);
+
+            if (t instanceof TimeoutException) {
+                log.accept("🟧 AWAIT TIMEOUT symbol=" + symbol
+                        + " callId=" + callId + " putId=" + putId
+                        + " => retry polling in " + AWAIT_RETRY_DELAY_MILLIS + "ms");
+
+                delay(AWAIT_RETRY_DELAY_MILLIS).whenComplete((v, delayEx) -> {
+                    if (delayEx != null) {
+                        out.completeExceptionally(unwrapCompletionException(delayEx));
+                        return;
+                    }
+                    awaitAttempt(symbol, callId, putId, out);
                 });
+                return;
+            }
+
+            out.completeExceptionally(t);
+        });
     }
 
-    /**
-     * One-shot contract status by id (no streaming).
-     */
-    public CompletableFuture<ContractOutcome> getContractOutcomeOnce(long contractId) {
+    private CompletableFuture<Void> delay(long millis) {
+        if (millis <= 0) return CompletableFuture.completedFuture(null);
+
+        CompletableFuture<Void> cf = new CompletableFuture<>();
+        poller.schedule(() -> cf.complete(null), millis, TimeUnit.MILLISECONDS);
+        return cf;
+    }
+
+    private CompletableFuture<BuySellResult> awaitBothSold(String symbol, long callId, long putId) {
+        Objects.requireNonNull(symbol, "symbol");
+
+        CompletableFuture<BuySellResult> out = new CompletableFuture<>();
+
+        AtomicReference<PocState> call = new AtomicReference<>();
+        AtomicReference<PocState> put  = new AtomicReference<>();
+
+        // Prevent overlapping POC requests per contract.
+        AtomicBoolean callInFlight = new AtomicBoolean(false);
+        AtomicBoolean putInFlight  = new AtomicBoolean(false);
+
+        // Track polling errors but do NOT fail immediately (we keep polling until timeout).
+        AtomicInteger callErrCount = new AtomicInteger(0);
+        AtomicInteger putErrCount  = new AtomicInteger(0);
+        AtomicReference<String> callLastErr = new AtomicReference<>(null);
+        AtomicReference<String> putLastErr  = new AtomicReference<>(null);
+
+        long startMs = System.currentTimeMillis();
+
+        AtomicReference<ScheduledFuture<?>> futureRef = new AtomicReference<>();
+        Runnable tick = () -> {
+            if (out.isDone()) return;
+
+            long elapsed = System.currentTimeMillis() - startMs;
+            if (elapsed > AWAIT_TIMEOUT_MILLIS) {
+                out.completeExceptionally(new TimeoutException(
+                        "buySellAndAwait timeout. symbol=" + symbol + " callId=" + callId + " putId=" + putId
+                                + " callErrs=" + callErrCount.get() + " putErrs=" + putErrCount.get()
+                ));
+                return;
+            }
+
+            PocState cs = call.get();
+            if ((cs == null || !cs.sold) && callInFlight.compareAndSet(false, true)) {
+                pollOneContract(symbol, callId, "CALL")
+                        .whenComplete((st, ex) -> {
+                            try {
+                                if (ex != null) {
+                                    int n = callErrCount.incrementAndGet();
+                                    String msg = formatErr(ex);
+                                    callLastErr.set(msg);
+                                    log.accept("🟥 POC ERROR CALL symbol=" + symbol + " contractId=" + callId
+                                            + " count=" + n + " err=" + msg);
+                                } else {
+                                    call.set(st);
+                                    maybeComplete(
+                                            symbol, callId, putId,
+                                            call.get(), put.get(),
+                                            callErrCount.get(), putErrCount.get(),
+                                            callLastErr.get(), putLastErr.get(),
+                                            out
+                                    );
+                                }
+                            } finally {
+                                callInFlight.set(false);
+                            }
+                        });
+            }
+
+            PocState ps = put.get();
+            if ((ps == null || !ps.sold) && putInFlight.compareAndSet(false, true)) {
+                pollOneContract(symbol, putId, "PUT")
+                        .whenComplete((st, ex) -> {
+                            try {
+                                if (ex != null) {
+                                    int n = putErrCount.incrementAndGet();
+                                    String msg = formatErr(ex);
+                                    putLastErr.set(msg);
+                                    log.accept("🟥 POC ERROR PUT symbol=" + symbol + " contractId=" + putId
+                                            + " count=" + n + " err=" + msg);
+                                } else {
+                                    put.set(st);
+                                    maybeComplete(
+                                            symbol, callId, putId,
+                                            call.get(), put.get(),
+                                            callErrCount.get(), putErrCount.get(),
+                                            callLastErr.get(), putLastErr.get(),
+                                            out
+                                    );
+                                }
+                            } finally {
+                                putInFlight.set(false);
+                            }
+                        });
+            }
+        };
+
+        ScheduledFuture<?> f = poller.scheduleAtFixedRate(tick, 0, AWAIT_POLL_PERIOD_MILLIS, TimeUnit.MILLISECONDS);
+        futureRef.set(f);
+
+        out.whenComplete((r, ex) -> {
+            ScheduledFuture<?> ff = futureRef.get();
+            if (ff != null) ff.cancel(false);
+        });
+
+        return out;
+    }
+
+    private void maybeComplete(
+            String symbol,
+            long callId,
+            long putId,
+            PocState call,
+            PocState put,
+            int callErrs,
+            int putErrs,
+            String callLastErr,
+            String putLastErr,
+            CompletableFuture<BuySellResult> out
+    ) {
+        if (out.isDone()) return;
+        if (call == null || put == null) return;
+        if (!call.sold || !put.sold) return;
+
+        boolean success = (call.profit > 0.0) || (put.profit > 0.0);
+
+        // Log ONLY final result + error summary (no per-second spam).
+        log.accept("🟩 DONE symbol=" + symbol
+                + " callId=" + callId + " status=" + call.status + " profit=" + call.profit + " expired=" + (call.expired ? 1 : 0)
+                + " | putId=" + putId + " status=" + put.status + " profit=" + put.profit + " expired=" + (put.expired ? 1 : 0)
+                + " | pollErrors(call=" + callErrs + (callLastErr != null ? (", last=" + callLastErr) : "")
+                + ", put=" + putErrs + (putLastErr != null ? (", last=" + putLastErr) : "") + ")"
+                + " => " + (success ? "SUCCESS" : "FAIL"));
+
+        out.complete(success ? BuySellResult.SUCCESS : BuySellResult.FAIL);
+    }
+
+    private CompletableFuture<PocState> pollOneContract(String symbol, long contractId, String tag) {
         ObjectNode req = mapper.createObjectNode();
         req.put("proposal_open_contract", 1);
         req.put("contract_id", contractId);
+        req.put("req_id", reqSeq.getAndIncrement());
 
-        return ws().sendRequest(req).thenApply(resp -> parseOutcomeFromProposalOpenContract(contractId, resp));
-    }
+        return ws().sendRequest(req).thenApply(resp -> {
+            // No per-tick logging here.
 
-    /**
-     * Poll proposal_open_contract until contract is sold/expired.
-     */
-    public CompletableFuture<ContractOutcome> waitUntilClosedByPolling(
-            long contractId,
-            Duration timeout,
-            Duration pollInterval
-    ) {
-        Objects.requireNonNull(timeout, "timeout");
-        Objects.requireNonNull(pollInterval, "pollInterval");
-
-        CompletableFuture<ContractOutcome> result = new CompletableFuture<>();
-        Instant deadline = Instant.now().plus(timeout);
-
-        AtomicBoolean running = new AtomicBoolean(true);
-
-        Runnable tick = () -> {
-            if (!running.get()) {
-                return;
-            }
-            if (Instant.now().isAfter(deadline)) {
-                running.set(false);
-                result.completeExceptionally(new TimeoutException("Contract " + contractId + " not closed within " + timeout));
-                return;
+            JsonNode err = resp.path("error");
+            if (!err.isMissingNode() && !err.isNull()) {
+                throw new IllegalStateException("POC error. tag=" + tag + " symbol=" + symbol + " id=" + contractId + " err=" + err);
             }
 
-            getContractOutcomeOnce(contractId).whenComplete((outcome, ex) -> {
-                if (!running.get()) {
-                    return;
-                }
-                if (ex != null) {
-                    running.set(false);
-                    result.completeExceptionally(ex);
-                    return;
-                }
+            JsonNode poc = resp.path("proposal_open_contract");
+            if (poc.isMissingNode() || poc.isNull()) {
+                throw new IllegalStateException("POC missing proposal_open_contract. tag=" + tag + " symbol=" + symbol + " id=" + contractId);
+            }
 
-                if (outcome.isClosed()) {
-                    running.set(false);
-                    result.complete(outcome);
-                }
-                // else keep polling
-            });
-        };
+            boolean sold = poc.path("is_sold").asInt(0) == 1;
+            boolean expired = poc.path("is_expired").asInt(0) == 1;
 
-        ScheduledFuture<?> sf = statusPoller.scheduleAtFixedRate(
-                tick,
-                0,
-                pollInterval.toMillis(),
-                TimeUnit.MILLISECONDS
-        );
+            // Keep status as-is from API (even if it looks weird like "failed").
+            String status = poc.path("status").asText("");
+            double profit = poc.path("profit").asDouble(0.0);
 
-        // Stop the scheduler task when result completes (anyhow)
-        result.whenComplete((ok, ex) -> sf.cancel(false));
-
-        return result;
+            return new PocState(sold, expired, status, profit, resp);
+        });
     }
 
-    private CompletableFuture<Long> buy(String contractType, Contract contract) {
-        if (derivCurrencyHolder.getCurrency().isEmpty()) {
-            throw new IllegalStateException("Currency not set");
+    private CompletableFuture<BuyAck> buyAck(String contractType, Contract contract) {
+        try {
+            if (derivCurrencyHolder.getCurrency().isEmpty()) {
+                return CompletableFuture.failedFuture(new IllegalStateException("Currency not set"));
+            }
+            if (connectorHolder.getConnector().isEmpty()) {
+                return CompletableFuture.failedFuture(new IllegalStateException("Deriv connector not set"));
+            }
+
+            Objects.requireNonNull(contract, "contract");
+
+            ObjectNode params = mapper.createObjectNode();
+            params.put("amount", contract.stake());
+            params.put("basis", contract.basis());
+            params.put("contract_type", contractType);
+            params.put("currency", derivCurrencyHolder.getCurrency().get());
+            params.put("duration", contract.durationTicks());
+            params.put("duration_unit", contract.durationUnit());
+            params.put("symbol", contract.symbol());
+
+            ObjectNode buy = mapper.createObjectNode();
+            buy.put("buy", 1);
+            buy.put("price", contract.stake());
+            buy.set("parameters", params);
+
+            return ws().sendRequest(buy).thenApply(this::extractBuyAck);
+        } catch (Throwable t) {
+            return CompletableFuture.failedFuture(t);
         }
-        if (connectorHolder.getConnector().isEmpty()) {
-            throw new IllegalStateException("Deriv connector not set");
+    }
+
+    private BuyAck extractBuyAck(JsonNode resp) {
+        if (resp == null) throw new IllegalStateException("Null response");
+
+        JsonNode err = resp.path("error");
+        if (!err.isMissingNode() && !err.isNull()) {
+            throw new IllegalStateException("Deriv error in buy: " + err);
         }
 
-        Objects.requireNonNull(contract, "contract");
+        JsonNode buy = resp.path("buy");
+        long contractId = buy.path("contract_id").asLong(-1);
+        if (contractId <= 0) throw new IllegalStateException("No buy.contract_id. resp=" + resp);
 
-        ObjectNode params = mapper.createObjectNode();
-        params.put("amount", contract.stake());
-        params.put("basis", contract.basis());
-        params.put("contract_type", contractType);
-        params.put("currency", derivCurrencyHolder.getCurrency().get());
-        params.put("duration", contract.durationTicks());
-        params.put("duration_unit", contract.durationUnit());
-        params.put("symbol", contract.symbol());
+        Long txId = buy.path("transaction_id").isMissingNode() || buy.path("transaction_id").isNull()
+                ? null
+                : buy.path("transaction_id").asLong();
 
-        ObjectNode buy = mapper.createObjectNode();
-        buy.put("buy", 1);
-        buy.put("price", contract.stake());
-        buy.set("parameters", params);
-
-        return ws().sendRequest(buy).thenApply(this::extractContractId);
+        return new BuyAck(contractId, txId);
     }
 
     private DerivConnector ws() {
@@ -172,51 +361,22 @@ public class DerivTradingService {
                 .orElseThrow(() -> new IllegalStateException("Deriv connector not set"));
     }
 
-    private long extractContractId(JsonNode resp) {
-        long contractId = resp.path("buy").path("contract_id").asLong(-1);
-        if (contractId <= 0) {
-            throw new IllegalStateException("No buy.contract_id. resp=" + resp);
-        }
-        return contractId;
+    private static String formatErr(Throwable ex) {
+        Throwable t = unwrapCompletionException(ex);
+        String msg = t.getMessage();
+        if (msg == null || msg.isBlank()) msg = t.toString();
+        return t.getClass().getSimpleName() + ": " + msg;
     }
 
-    private ContractOutcome parseOutcomeFromProposalOpenContract(long contractId, JsonNode resp) {
-        JsonNode poc = resp.path("proposal_open_contract");
-        if (poc.isMissingNode() || poc.isNull()) {
-            throw new IllegalStateException("No proposal_open_contract in resp=" + resp);
+    private static Throwable unwrapCompletionException(Throwable ex) {
+        Throwable t = ex;
+        while ((t instanceof CompletionException || t instanceof ExecutionException) && t.getCause() != null) {
+            t = t.getCause();
         }
-
-        // Deriv typically returns: is_sold: 0/1, status: "open"/"won"/"lost", profit, payout, etc.
-        boolean isSold = poc.path("is_sold").asInt(0) == 1;
-
-        String status = Optional.ofNullable(poc.path("status").asText(null)).orElse("unknown");
-        double profit = poc.path("profit").asDouble(Double.NaN);
-
-        // "won" / "lost" are common end states.
-        boolean isWin = "won".equalsIgnoreCase(status);
-
-        // If closed but status unknown, treat as not win (conservative) but still closed.
-        return new ContractOutcome(contractId, isSold, isWin, status, profit);
+        return t;
     }
 
-    public record BothBuyStatus(
-            long riseContractId,
-            long fallContractId,
-            ContractOutcome rise,
-            ContractOutcome fall,
-            Instant completedAt
-    ) {
-        public boolean isSuccess() {
-            // Your rule: if at least one is win => success
-            return (rise != null && rise.isWin()) || (fall != null && fall.isWin());
-        }
-    }
+    private record BuyAck(long contractId, Long transactionId) { }
 
-    public record ContractOutcome(
-            long contractId,
-            boolean isClosed,
-            boolean isWin,
-            String status,
-            double profit
-    ) {}
+    private record PocState(boolean sold, boolean expired, String status, double profit, JsonNode payload) { }
 }

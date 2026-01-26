@@ -36,7 +36,11 @@ public class DerivWsClient extends WebSocketClient {
      */
     private volatile BiConsumer<String, Exception> disconnectListener;
 
-    public DerivWsClient(URI serverUri, String token, Consumer<String> log, TickHandler tickHandler, BalanceHandler balanceHandler) {
+    public DerivWsClient(URI serverUri,
+                         String token,
+                         Consumer<String> log,
+                         TickHandler tickHandler,
+                         BalanceHandler balanceHandler) {
         super(serverUri);
         this.balanceHandler = balanceHandler;
         if (token == null || token.isBlank()) {

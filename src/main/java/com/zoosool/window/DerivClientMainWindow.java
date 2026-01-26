@@ -27,12 +27,13 @@ public class DerivClientMainWindow {
     private final TextField stakeField = new TextField();
 
     private final ComboBox<ActiveSymbol> selectorCurrentAsset = new ComboBox<>();
-    private final ComboBox<Integer> selectorDurationTicks = new ComboBox<>(observableArrayList(2, 4, 6, 8, 10, 15, 17, 19));
+    private final ComboBox<Integer> selectorDurationTicks = new ComboBox<>(observableArrayList(2, 4, 6, 8, 10, 15, 17, 19, 35, 43, 57, 61));
     private final ComboBox<String> selectorBasis = new ComboBox<>(observableArrayList("payout", "stake"));
 
     private final Button buyButton = new Button("BUY");
     private final Button sellButton = new Button("SELL");
     private final Button buySellButton = new Button("BUY/SELL");
+    private final Button buySellSmartButton = new Button("BUY/SELL/s");
 
     private static final String DURATION_UNIT_T = "t";
     private static final String DURATION_UNIT_S = "s";
@@ -212,7 +213,7 @@ public class DerivClientMainWindow {
         form.add(stakeField, 1, 3);
 
         // Buttons row
-        HBox buttons = new HBox(10, buySellButton, buyButton, sellButton);
+        HBox buttons = new HBox(10, buySellSmartButton, buySellButton, buyButton, sellButton);
         buttons.setAlignment(Pos.CENTER_LEFT);
 
         styleButtons();
@@ -287,6 +288,31 @@ public class DerivClientMainWindow {
             stakeField.clear();
         });
 
+        buySellSmartButton.setOnAction(e -> {
+            BigDecimal stake = parseStakeOrLog();
+            if (stake == null) return;
+
+            ActiveSymbol asset = selectorCurrentAsset.getValue();
+            if (asset == null) {
+                logView.log("Current asset is not selected");
+                return;
+            }
+
+            logView.log("BUY/SELL smart clicked. stake=" + stake + ", asset=" + asset.symbol());
+
+            this.operations.buySellS(new Contract(
+                    asset.symbol(),
+                    stake,
+                    (((59 - java.time.LocalDateTime.now().getSecond()) & 1) == 1)
+                            ? (59 - java.time.LocalDateTime.now().getSecond())
+                            : Math.max(1, (59 - java.time.LocalDateTime.now().getSecond()) - 1),
+                    DURATION_UNIT_S,
+                    selectorBasis.getValue()
+            ));
+
+            stakeField.clear();
+        });
+
         // Log (wrap into a titled pane to look cleaner)
         VBox logBox = new VBox(8);
         logBox.setPadding(new Insets(10));
@@ -333,14 +359,17 @@ public class DerivClientMainWindow {
     }
 
     private void styleButtons() {
+        stylePrimary(buySellSmartButton, "#7c3aaa");
         stylePrimary(buySellButton, "#7c3aed"); // violet
         stylePrimary(buyButton, "#22c55e");     // green
         stylePrimary(sellButton, "#ef4444");    // red
 
+        buySellSmartButton.setPrefHeight(36);
         buySellButton.setPrefHeight(36);
         buyButton.setPrefHeight(36);
         sellButton.setPrefHeight(36);
 
+        buySellSmartButton.setMinWidth(120);
         buySellButton.setMinWidth(120);
         buyButton.setMinWidth(90);
         sellButton.setMinWidth(90);
