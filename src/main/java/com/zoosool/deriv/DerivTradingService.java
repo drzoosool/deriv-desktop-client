@@ -1,3 +1,5 @@
+// DerivTradingService.java
+// (оставляю твою текущую логику: не ребаим, а ретраим polling до результата; лог только финала + ошибок polling)
 package com.zoosool.deriv;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -14,13 +16,10 @@ import java.util.function.Consumer;
 
 public final class DerivTradingService {
 
-    // Await-mode polling cadence.
     private static final long AWAIT_POLL_PERIOD_MILLIS = 1_000;
 
-    // 10 minutes fail-safe.
     private static final long AWAIT_TIMEOUT_MILLIS = 10 * 60_000L;
 
-    // If await timed out, retry polling (same contract ids) after small delay.
     private static final long AWAIT_RETRY_DELAY_MILLIS = 1_000;
 
     private final ObjectMapper mapper = new ObjectMapper();
@@ -48,19 +47,10 @@ public final class DerivTradingService {
         });
     }
 
-    // Kept: backward-compatible behavior (buys CALL + PUT, does not await).
     public CompletableFuture<Void> buyBoth(Contract contract) {
         return buyBoth(contract, false);
     }
 
-    /**
-     * Kept for compatibility. "hold" is no longer used (subscriptions/holder removed),
-     * but the signature stays so existing callers compile.
-     *
-     * Behavior:
-     * - buys CALL and PUT
-     * - returns when both BUY acks received (ids are obtained)
-     */
     public CompletableFuture<Void> buyBoth(Contract contract, boolean hold) {
         Objects.requireNonNull(contract, "contract");
 
@@ -84,16 +74,6 @@ public final class DerivTradingService {
 
     public enum BuySellResult { SUCCESS, FAIL }
 
-    /**
-     * BUY CALL + BUY PUT, then poll both via proposal_open_contract (no subscriptions),
-     * until both are is_sold==1.
-     *
-     * SUCCESS: (profit(call) > 0) OR (profit(put) > 0)
-     * FAIL: both profits <= 0
-     *
-     * If polling times out, it retries polling (same contract ids) until it succeeds.
-     * It does NOT re-buy contracts.
-     */
     public CompletableFuture<BuySellResult> buySellAndAwait(Contract contract) {
         Objects.requireNonNull(contract, "contract");
 
@@ -156,11 +136,9 @@ public final class DerivTradingService {
         AtomicReference<PocState> call = new AtomicReference<>();
         AtomicReference<PocState> put  = new AtomicReference<>();
 
-        // Prevent overlapping POC requests per contract.
         AtomicBoolean callInFlight = new AtomicBoolean(false);
         AtomicBoolean putInFlight  = new AtomicBoolean(false);
 
-        // Track polling errors but do NOT fail immediately (we keep polling until timeout).
         AtomicInteger callErrCount = new AtomicInteger(0);
         AtomicInteger putErrCount  = new AtomicInteger(0);
         AtomicReference<String> callLastErr = new AtomicReference<>(null);
@@ -194,13 +172,10 @@ public final class DerivTradingService {
                                             + " count=" + n + " err=" + msg);
                                 } else {
                                     call.set(st);
-                                    maybeComplete(
-                                            symbol, callId, putId,
-                                            call.get(), put.get(),
+                                    maybeComplete(symbol, callId, putId, call.get(), put.get(),
                                             callErrCount.get(), putErrCount.get(),
                                             callLastErr.get(), putLastErr.get(),
-                                            out
-                                    );
+                                            out);
                                 }
                             } finally {
                                 callInFlight.set(false);
@@ -221,13 +196,10 @@ public final class DerivTradingService {
                                             + " count=" + n + " err=" + msg);
                                 } else {
                                     put.set(st);
-                                    maybeComplete(
-                                            symbol, callId, putId,
-                                            call.get(), put.get(),
+                                    maybeComplete(symbol, callId, putId, call.get(), put.get(),
                                             callErrCount.get(), putErrCount.get(),
                                             callLastErr.get(), putLastErr.get(),
-                                            out
-                                    );
+                                            out);
                                 }
                             } finally {
                                 putInFlight.set(false);
@@ -265,7 +237,6 @@ public final class DerivTradingService {
 
         boolean success = (call.profit > 0.0) || (put.profit > 0.0);
 
-        // Log ONLY final result + error summary (no per-second spam).
         log.accept("🟩 DONE symbol=" + symbol
                 + " callId=" + callId + " status=" + call.status + " profit=" + call.profit + " expired=" + (call.expired ? 1 : 0)
                 + " | putId=" + putId + " status=" + put.status + " profit=" + put.profit + " expired=" + (put.expired ? 1 : 0)
@@ -283,8 +254,6 @@ public final class DerivTradingService {
         req.put("req_id", reqSeq.getAndIncrement());
 
         return ws().sendRequest(req).thenApply(resp -> {
-            // No per-tick logging here.
-
             JsonNode err = resp.path("error");
             if (!err.isMissingNode() && !err.isNull()) {
                 throw new IllegalStateException("POC error. tag=" + tag + " symbol=" + symbol + " id=" + contractId + " err=" + err);
@@ -297,8 +266,6 @@ public final class DerivTradingService {
 
             boolean sold = poc.path("is_sold").asInt(0) == 1;
             boolean expired = poc.path("is_expired").asInt(0) == 1;
-
-            // Keep status as-is from API (even if it looks weird like "failed").
             String status = poc.path("status").asText("");
             double profit = poc.path("profit").asDouble(0.0);
 

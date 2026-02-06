@@ -1,3 +1,4 @@
+// StreakUniqueLevelTradeDecisionMaker.java
 package com.zoosool.analyze;
 
 import com.zoosool.deriv.BalanceHolder;
@@ -26,19 +27,22 @@ import java.util.function.Consumer;
  *
  * Cooldown:
  * - After any FAIL wait 2 minutes (ignore signals).
+ *
+ * Important fix:
+ * - NO "stale inFlight release" (it causes overlapping trades and out-of-order ladder resets).
+ * - cooldown starts from RESULT time (not from plan epochSecond).
  */
 public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionMaker {
 
-    private static final String ALLOWED_SYMBOL = "stpRNG";
+    private static final String ALLOWED_SYMBOL = "stpRNG5";
 
     private static final BigDecimal[] LADDER = {
             BigDecimal.valueOf(1),
-            //BigDecimal.valueOf(10),
-            BigDecimal.valueOf(100),
-            BigDecimal.valueOf(1000)
+            BigDecimal.valueOf(12),
+            BigDecimal.valueOf(160)
     };
 
-    private static final int TAPE_KEEP_SECONDS = 180;
+    private static final int TAPE_KEEP_SECONDS = 60;
     private static final int MIN_HISTORY_SECONDS_BEFORE_TRADING = TAPE_KEEP_SECONDS;
 
     private static final int LEVEL_REPEAT_MAX_AGE_SECONDS = 30;
@@ -47,12 +51,11 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private static final int ACTIVE_WINDOW_SEC_FROM = 3;
     private static final int ACTIVE_WINDOW_SEC_TO = 35;
 
-    private static final long IN_FLIGHT_STALE_SECONDS = 90L;
-
-    private static final long COOLDOWN_AFTER_FAIL_SECONDS = 600L; // prev 120 sec 2 min
+    private static final long COOLDOWN_AFTER_FAIL_SECONDS = 300; //120L; // 2 minutes
 
     private static final String DEFAULT_DURATION_UNIT = "s";
-    private static final String DEFAULT_STAKE_TYPE = "payout";
+    //private static final String DEFAULT_STAKE_TYPE = "payout";
+    private static final String DEFAULT_STAKE_TYPE = "stake";
 
     private enum Direction { UP, DOWN, NONE }
 
@@ -62,6 +65,7 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private final Consumer<String> log;
     private final ZoneId zone = ZoneId.systemDefault();
 
+    @SuppressWarnings("unused")
     private final GlobalLevelTape tape = new GlobalLevelTape(TAPE_KEEP_SECONDS);
 
     private final ConcurrentMap<Long, Long> lastSeenEpochByLevel = new ConcurrentHashMap<>();
@@ -82,8 +86,14 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
 
     private int ladderIdx = 0;
 
-    // New: cooldown after FAIL
     private long cooldownUntilEpochSecond = -1;
+
+    /**
+     * Protect against out-of-order completion or accidental overlapping futures.
+     * Even though we gate with inFlight, this makes ladder updates bulletproof.
+     */
+    private long nextTradeSeq = 1;
+    private long lastSettledTradeSeq = 0;
 
     private InFlightTrade inFlight = null;
 
@@ -129,8 +139,6 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
             }
 
             tape.put(nowEpochSecond, level);
-
-            maybeReleaseStaleInFlightLocked(nowEpochSecond, ldt);
             maybePurgeLastSeenLevels(nowEpochSecond);
 
             // Same second (multiple events in same epochSecond): only remember lastSeen and exit.
@@ -184,14 +192,14 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                             DEFAULT_STAKE_TYPE
                     );
 
-                    // mark in-flight immediately (gate)
-                    inFlight = new InFlightTrade(nowEpochSecond, symbol, stake.stakePerSide(), null);
-                    lastTradeMinuteBucket = nowEpochSecond / 60;
+                    long tradeSeq = nextTradeSeq++;
 
-                    // disarm after scheduling trade
+                    inFlight = new InFlightTrade(tradeSeq, nowEpochSecond, symbol, stake.stakePerSide(), null);
+                    lastTradeMinuteBucket = nowEpochSecond / 60;
                     armed = false;
 
                     plan = new TradePlan(
+                            tradeSeq,
                             nowEpochSecond,
                             ldt,
                             symbol,
@@ -215,6 +223,7 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
 
             log.accept("🟦 RULE_TRADE"
                     + " time=" + plan.ldt()
+                    + " tradeSeq=" + plan.tradeSeq()
                     + " epochSecond=" + plan.epochSecond()
                     + " symbol=" + plan.symbol()
                     + " sec=" + String.format("%02d", plan.ldt().getSecond())
@@ -230,7 +239,8 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                     + " rule=streak>=" + DIR_STREAK_MIN_SECONDS
                     + " uniqueLevelAge>" + LEVEL_REPEAT_MAX_AGE_SECONDS
                     + " window=" + String.format("%02d", ACTIVE_WINDOW_SEC_FROM) + ".." + String.format("%02d", ACTIVE_WINDOW_SEC_TO)
-                    + " warmupNeedSec=" + MIN_HISTORY_SECONDS_BEFORE_TRADING);
+                    + " warmupNeedSec=" + MIN_HISTORY_SECONDS_BEFORE_TRADING
+                    + " cooldownUntilEpoch=" + cooldownUntilEpochSecond);
 
             CompletableFuture<DerivTradingService.BuySellResult> fut = trading.buySellAndAwait(plan.contract());
             wireInFlightFuture(plan, fut);
@@ -239,8 +249,9 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
 
     private void wireInFlightFuture(TradePlan plan, CompletableFuture<DerivTradingService.BuySellResult> fut) {
         synchronized (this) {
-            if (inFlight != null && inFlight.epochSecond() == plan.epochSecond()) {
-                inFlight = new InFlightTrade(plan.epochSecond(), plan.symbol(), plan.stake().stakePerSide(), fut);
+            InFlightTrade cur = inFlight;
+            if (cur != null && cur.tradeSeq() == plan.tradeSeq()) {
+                inFlight = new InFlightTrade(cur.tradeSeq(), cur.epochSecond(), cur.symbol(), cur.stakePerSide(), fut);
             }
         }
 
@@ -250,8 +261,8 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
             } finally {
                 synchronized (this) {
                     InFlightTrade cur = inFlight;
-                    if (cur != null && cur.epochSecond() == plan.epochSecond()) {
-                        inFlight = null; // unblock trading
+                    if (cur != null && cur.tradeSeq() == plan.tradeSeq()) {
+                        inFlight = null;
                     }
                 }
             }
@@ -261,8 +272,10 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private void applyResult(TradePlan plan, DerivTradingService.BuySellResult res, Throwable ex) {
         LocalDateTime ldt = LocalDateTime.now(zone);
 
-        boolean success = (res == DerivTradingService.BuySellResult.SUCCESS);
-        String exText = (ex == null) ? "" : (" ex=" + unwrapCompletion(ex));
+        Throwable rootEx = (ex == null) ? null : unwrapCompletion(ex);
+        String exText = (rootEx == null) ? "" : (" ex=" + rootEx);
+
+        boolean success = (rootEx == null && res == DerivTradingService.BuySellResult.SUCCESS);
 
         int prevIdx;
         int newIdx;
@@ -270,9 +283,22 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
         long cooldownUntil;
 
         synchronized (this) {
+            if (plan.tradeSeq() <= lastSettledTradeSeq) {
+                log.accept("🟧 RESULT_IGNORED_OUTDATED"
+                        + " time=" + ldt
+                        + " tradeSeq=" + plan.tradeSeq()
+                        + " lastSettled=" + lastSettledTradeSeq
+                        + " symbol=" + plan.symbol()
+                        + " res=" + (res == null ? "null" : res)
+                        + exText);
+                return;
+            }
+            lastSettledTradeSeq = plan.tradeSeq();
+
             if (stopped) {
                 log.accept("🟥 RESULT_IGNORED_STOPPED"
                         + " time=" + ldt
+                        + " tradeSeq=" + plan.tradeSeq()
                         + " symbol=" + plan.symbol()
                         + " res=" + (res == null ? "null" : res)
                         + exText
@@ -288,16 +314,18 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                 ladderIdx = 0;
             } else {
                 ladderIdx = Math.min(ladderIdx + 1, LADDER.length - 1);
-                // New: start/extend cooldown after FAIL
-                cooldownUntilEpochSecond = Math.max(cooldownUntilEpochSecond, plan.epochSecond() + COOLDOWN_AFTER_FAIL_SECONDS);
-            }
-            newIdx = ladderIdx;
 
+                // cooldown starts from RESULT time, not from plan time
+                long nowSec = Instant.now().getEpochSecond();
+                cooldownUntilEpochSecond = Math.max(cooldownUntilEpochSecond, nowSec + COOLDOWN_AFTER_FAIL_SECONDS);
+            }
+
+            newIdx = ladderIdx;
             cooldownUntil = cooldownUntilEpochSecond;
 
             if (failOnLastStep) {
                 stopped = true;
-                stopReason = (ex != null ? "LAST_STEP_ERROR->FAIL" : "LAST_STEP_FAIL");
+                stopReason = (rootEx != null ? "LAST_STEP_ERROR->FAIL" : "LAST_STEP_FAIL");
                 stopAt = ldt;
             }
         }
@@ -305,6 +333,7 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
         if (failOnLastStep) {
             log.accept("🟥 STOP_TRADING"
                     + " time=" + ldt
+                    + " tradeSeq=" + plan.tradeSeq()
                     + " symbol=" + plan.symbol()
                     + " res=" + (res == null ? "null" : res.name())
                     + exText
@@ -317,14 +346,17 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
         if (success) {
             log.accept("✅ RESULT"
                     + " time=" + ldt
+                    + " tradeSeq=" + plan.tradeSeq()
                     + " symbol=" + plan.symbol()
                     + " res=SUCCESS"
                     + exText
                     + " ladder " + prevIdx + "->" + newIdx
-                    + " nextStake=" + LADDER[newIdx]);
+                    + " nextStake=" + LADDER[newIdx]
+                    + " cooldownUntilEpoch=" + cooldownUntil);
         } else {
             log.accept("❌ RESULT"
                     + " time=" + ldt
+                    + " tradeSeq=" + plan.tradeSeq()
                     + " symbol=" + plan.symbol()
                     + " res=FAIL"
                     + exText
@@ -335,10 +367,9 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
         }
     }
 
-    private Throwable unwrapCompletion(Throwable ex) {
+    private static Throwable unwrapCompletion(Throwable ex) {
         Throwable t = ex;
-        while (t instanceof CompletionException || t instanceof ExecutionException) {
-            if (t.getCause() == null) break;
+        while ((t instanceof CompletionException || t instanceof ExecutionException) && t.getCause() != null) {
             t = t.getCause();
         }
         return t;
@@ -377,23 +408,6 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
             long age = nowEpochSecond - firstTapeEpochSecond;
             log.accept("🟩 WARMUP_END time=" + ldt + " historySec=" + age + " tapeHorizonSec=" + TAPE_KEEP_SECONDS);
         }
-    }
-
-    private void maybeReleaseStaleInFlightLocked(long nowEpochSecond, LocalDateTime ldt) {
-        if (inFlight == null) {
-            return;
-        }
-        long age = nowEpochSecond - inFlight.epochSecond();
-        if (age <= IN_FLIGHT_STALE_SECONDS) {
-            return;
-        }
-
-        log.accept("⚠️ IN_FLIGHT_STALE_RELEASE"
-                + " time=" + ldt
-                + " symbol=" + inFlight.symbol()
-                + " ageSec=" + age);
-
-        inFlight = null; // unblock trading even if result never came
     }
 
     private void updateDirectionAndStreakLocked(Long currentLevel) {
@@ -471,6 +485,7 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private record StakeSnapshot(int ladderIdxAtSend, BigDecimal stakePerSide) {}
 
     private record InFlightTrade(
+            long tradeSeq,
             long epochSecond,
             String symbol,
             BigDecimal stakePerSide,
@@ -478,6 +493,7 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     ) {}
 
     private record TradePlan(
+            long tradeSeq,
             long epochSecond,
             LocalDateTime ldt,
             String symbol,
