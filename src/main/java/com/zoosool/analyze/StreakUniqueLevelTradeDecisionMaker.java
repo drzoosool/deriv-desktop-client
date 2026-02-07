@@ -11,9 +11,11 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.Objects;
-import java.util.concurrent.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
@@ -26,7 +28,7 @@ import java.util.function.Consumer;
  * - Ladder resets on SUCCESS; increases on FAIL.
  *
  * Cooldown:
- * - After any FAIL wait 2 minutes (ignore signals).
+ * - After any FAIL wait COOLDOWN_AFTER_FAIL_SECONDS (ignore signals).
  *
  * Important fix:
  * - NO "stale inFlight release" (it causes overlapping trades and out-of-order ladder resets).
@@ -34,7 +36,7 @@ import java.util.function.Consumer;
  */
 public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionMaker {
 
-    private static final String ALLOWED_SYMBOL = "stpRNG5";
+    private static final String ALLOWED_SYMBOL = "stpRNG2";
 
     private static final BigDecimal[] LADDER = {
             BigDecimal.valueOf(1),
@@ -51,11 +53,14 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private static final int ACTIVE_WINDOW_SEC_FROM = 3;
     private static final int ACTIVE_WINDOW_SEC_TO = 35;
 
-    private static final long COOLDOWN_AFTER_FAIL_SECONDS = 300; //120L; // 2 minutes
+    private static final long COOLDOWN_AFTER_FAIL_SECONDS = 120;
 
     private static final String DEFAULT_DURATION_UNIT = "s";
-    //private static final String DEFAULT_STAKE_TYPE = "payout";
     private static final String DEFAULT_STAKE_TYPE = "stake";
+
+    // --- logging switches ---
+    private static final boolean LOG_TAPE_PUT = false;          // minimal: time + epochSecond + level
+    private static final boolean LOG_GATES_AFTER_WARMUP = false; // optional debug, keep off by default
 
     private enum Direction { UP, DOWN, NONE }
 
@@ -65,7 +70,6 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private final Consumer<String> log;
     private final ZoneId zone = ZoneId.systemDefault();
 
-    @SuppressWarnings("unused")
     private final GlobalLevelTape tape = new GlobalLevelTape(TAPE_KEEP_SECONDS);
 
     private final ConcurrentMap<Long, Long> lastSeenEpochByLevel = new ConcurrentHashMap<>();
@@ -90,7 +94,6 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
 
     /**
      * Protect against out-of-order completion or accidental overlapping futures.
-     * Even though we gate with inFlight, this makes ladder updates bulletproof.
      */
     private long nextTradeSeq = 1;
     private long lastSettledTradeSeq = 0;
@@ -100,6 +103,12 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private boolean stopped = false;
     private String stopReason = null;
     private LocalDateTime stopAt = null;
+
+    // throttle for tape logging (log at most once per epochSecond)
+    private long lastTapeLogEpochSecond = -1;
+
+    // throttle for optional gate logs
+    private long lastGateLogEpochSecond = -1;
 
     public StreakUniqueLevelTradeDecisionMaker(
             DerivTradingService trading,
@@ -113,10 +122,6 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
 
     @Override
     public void decideAndTrade(String symbol, AnalyzeContainer analyze) {
-//        if (true) {
-//            return;
-//        }
-
         if (!ALLOWED_SYMBOL.equals(symbol)) {
             return;
         }
@@ -138,8 +143,15 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                 firstTapeEpochSecond = nowEpochSecond;
             }
 
+            // --- tape write ---
             tape.put(nowEpochSecond, level);
             maybePurgeLastSeenLevels(nowEpochSecond);
+
+            // minimal log: show exactly what we put into tape
+            if (LOG_TAPE_PUT && lastTapeLogEpochSecond != nowEpochSecond) {
+                lastTapeLogEpochSecond = nowEpochSecond;
+                log.accept("🧾 TAPE " + ldt + " epoch=" + nowEpochSecond + " level=" + level);
+            }
 
             // Same second (multiple events in same epochSecond): only remember lastSeen and exit.
             if (nowEpochSecond == lastProcessedEpochSecond) {
@@ -168,6 +180,29 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
             maybeLogWarmupStateLocked(ldt, nowEpochSecond, warmedUp);
 
             boolean inCooldown = (cooldownUntilEpochSecond > 0 && nowEpochSecond < cooldownUntilEpochSecond);
+            boolean canTradeMinute = canTradeThisMinuteLocked(nowEpochSecond);
+
+            if (LOG_GATES_AFTER_WARMUP && warmedUp && lastGateLogEpochSecond != nowEpochSecond) {
+                lastGateLogEpochSecond = nowEpochSecond;
+                String reason =
+                        stopped ? "STOPPED"
+                                : (!inWindow ? "OUT_OF_WINDOW"
+                                : (!armed ? "NOT_ARMED"
+                                : (inFlight != null ? "IN_FLIGHT"
+                                : (inCooldown ? "COOLDOWN"
+                                : (!canTradeMinute ? "ALREADY_TRADED_THIS_MINUTE"
+                                : "OK")))));
+
+                long cooldownLeft = inCooldown ? (cooldownUntilEpochSecond - nowEpochSecond) : 0;
+                log.accept("🧩 GATE " + ldt
+                        + " reason=" + reason
+                        + " dir=" + direction
+                        + " streak=" + directionStreak
+                        + " armed=" + armed
+                        + " inFlight=" + (inFlight == null ? "no" : ("yes(seq=" + inFlight.tradeSeq() + ")"))
+                        + " cooldownLeftSec=" + cooldownLeft
+                );
+            }
 
             if (warmedUp
                     && !stopped
@@ -175,7 +210,7 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                     && armed
                     && inFlight == null
                     && !inCooldown
-                    && canTradeThisMinuteLocked(nowEpochSecond)) {
+                    && canTradeMinute) {
 
                 Long lastSeen = lastSeenEpochByLevel.get(level);
                 boolean okByRepeatRule = (lastSeen == null) || (nowEpochSecond - lastSeen > LEVEL_REPEAT_MAX_AGE_SECONDS);
@@ -516,6 +551,11 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
         void put(long epochSecond, long level) {
             byEpoch.put(epochSecond, level);
             maybePurge(epochSecond);
+        }
+
+        @SuppressWarnings("unused")
+        Long get(long epochSecond) {
+            return byEpoch.get(epochSecond);
         }
 
         private void maybePurge(long nowEpochSecond) {

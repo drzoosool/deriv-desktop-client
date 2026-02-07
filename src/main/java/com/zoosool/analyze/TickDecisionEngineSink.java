@@ -62,7 +62,7 @@ public final class TickDecisionEngineSink implements TickStatsSink, Resetable {
 
             if (hasQuote) {
                 try {
-                    long level = NumberStringUtils.toLongByConcatDroppingTrailingZeros(quoteString);
+                    long level = NumberStringUtils.toScaledLong(quoteString, 4);
                     st.onLevel(level);
                 } catch (RuntimeException ignoreBadQuote) {
                     // Skip malformed quote formats.
