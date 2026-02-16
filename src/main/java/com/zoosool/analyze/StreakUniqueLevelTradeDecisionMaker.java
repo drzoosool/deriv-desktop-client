@@ -7,20 +7,19 @@ import com.zoosool.model.AnalyzeContainer;
 import com.zoosool.model.Contract;
 
 import java.math.BigDecimal;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
- * Singleton rule-based auto-trader for stpRNG.
+ * Rule-based auto-trader for stpRNG.
  *
  * Trading:
  * - Stake ladder per side (BUY-SELL, two sides).
@@ -31,20 +30,29 @@ import java.util.function.Consumer;
  * - After any FAIL wait COOLDOWN_AFTER_FAIL_SECONDS (ignore signals).
  *
  * Important fix:
- * - NO "stale inFlight release" (it causes overlapping trades and out-of-order ladder resets).
- * - cooldown starts from RESULT time (not from plan epochSecond).
+ * - NO "stale inFlight release" (overlapping trades / out-of-order ladder resets).
+ * - Cooldown starts from RESULT time (not from plan epochSecond).
+ *
+ * Dataset logging (agreement):
+ * - Tape is fixed 600 seconds (1Hz ring).
+ * - First warmup is 600 seconds (we want full dataset window).
+ * - On trade CLOSE: write ONE dataset record (JSONL) with last 600 seconds ending at result time.
+ * - Tape is NOT cleared (sliding window); trading logic continues as before.
  */
 public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionMaker {
 
-    private static final String ALLOWED_SYMBOL = "stpRNG2";
+    private static final String ALLOWED_SYMBOL = "stpRNG4";
 
     private static final BigDecimal[] LADDER = {
             BigDecimal.valueOf(1),
-            BigDecimal.valueOf(12),
-            BigDecimal.valueOf(160)
+            BigDecimal.valueOf(11),
+            BigDecimal.valueOf(112)
     };
 
-    private static final int TAPE_KEEP_SECONDS = 60;
+    // Dataset window and tape horizon.
+    private static final int TAPE_KEEP_SECONDS = 600;
+
+    // First warmup must be full 600 seconds.
     private static final int MIN_HISTORY_SECONDS_BEFORE_TRADING = TAPE_KEEP_SECONDS;
 
     private static final int LEVEL_REPEAT_MAX_AGE_SECONDS = 30;
@@ -58,10 +66,6 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private static final String DEFAULT_DURATION_UNIT = "s";
     private static final String DEFAULT_STAKE_TYPE = "stake";
 
-    // --- logging switches ---
-    private static final boolean LOG_TAPE_PUT = false;          // minimal: time + epochSecond + level
-    private static final boolean LOG_GATES_AFTER_WARMUP = false; // optional debug, keep off by default
-
     private enum Direction { UP, DOWN, NONE }
 
     private final DerivTradingService trading;
@@ -70,10 +74,12 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private final Consumer<String> log;
     private final ZoneId zone = ZoneId.systemDefault();
 
+    // Tape & level-seen map
     private final GlobalLevelTape tape = new GlobalLevelTape(TAPE_KEEP_SECONDS);
+    private final LongLongTtlMap lastSeenEpochByLevel = new LongLongTtlMap(TAPE_KEEP_SECONDS);
 
-    private final ConcurrentMap<Long, Long> lastSeenEpochByLevel = new ConcurrentHashMap<>();
-    private final AtomicLong lastSeenPurgeEpoch = new AtomicLong(-1);
+    // Dataset recorder: one file per app run
+    private final TradeHistoryRecorder recorder;
 
     private long firstTapeEpochSecond = -1;
     private boolean warmupStartLogged = false;
@@ -89,7 +95,6 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private long lastTradeMinuteBucket = -1;
 
     private int ladderIdx = 0;
-
     private long cooldownUntilEpochSecond = -1;
 
     /**
@@ -104,12 +109,6 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     private String stopReason = null;
     private LocalDateTime stopAt = null;
 
-    // throttle for tape logging (log at most once per epochSecond)
-    private long lastTapeLogEpochSecond = -1;
-
-    // throttle for optional gate logs
-    private long lastGateLogEpochSecond = -1;
-
     public StreakUniqueLevelTradeDecisionMaker(
             DerivTradingService trading,
             BalanceHolder balanceHolder,
@@ -118,6 +117,9 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
         this.trading = Objects.requireNonNull(trading, "trading");
         this.balanceHolder = Objects.requireNonNull(balanceHolder, "balanceHolder");
         this.log = Objects.requireNonNull(logger, "logger");
+
+        // Keep recorder quiet in main log; file is created under ./trade-data
+        this.recorder = new TradeHistoryRecorder(Path.of("trade-data"), s -> {});
     }
 
     @Override
@@ -143,23 +145,16 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                 firstTapeEpochSecond = nowEpochSecond;
             }
 
-            // --- tape write ---
+            // 1Hz tape point
             tape.put(nowEpochSecond, level);
-            maybePurgeLastSeenLevels(nowEpochSecond);
 
-            // minimal log: show exactly what we put into tape
-            if (LOG_TAPE_PUT && lastTapeLogEpochSecond != nowEpochSecond) {
-                lastTapeLogEpochSecond = nowEpochSecond;
-                log.accept("🧾 TAPE " + ldt + " epoch=" + nowEpochSecond + " level=" + level);
-            }
-
-            // Same second (multiple events in same epochSecond): only remember lastSeen and exit.
+            // Same second: just remember "seen" and exit (keep last value for this second)
             if (nowEpochSecond == lastProcessedEpochSecond) {
                 lastSeenEpochByLevel.put(level, nowEpochSecond);
                 return;
             }
 
-            // Gap -> reset to avoid fake "consecutive seconds"
+            // Gap -> reset streak window to avoid fake "consecutive seconds"
             if (lastProcessedEpochSecond >= 0 && (nowEpochSecond - lastProcessedEpochSecond) > 1) {
                 resetWindowStateLocked();
                 lastProcessedLevel = null;
@@ -180,29 +175,9 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
             maybeLogWarmupStateLocked(ldt, nowEpochSecond, warmedUp);
 
             boolean inCooldown = (cooldownUntilEpochSecond > 0 && nowEpochSecond < cooldownUntilEpochSecond);
-            boolean canTradeMinute = canTradeThisMinuteLocked(nowEpochSecond);
 
-            if (LOG_GATES_AFTER_WARMUP && warmedUp && lastGateLogEpochSecond != nowEpochSecond) {
-                lastGateLogEpochSecond = nowEpochSecond;
-                String reason =
-                        stopped ? "STOPPED"
-                                : (!inWindow ? "OUT_OF_WINDOW"
-                                : (!armed ? "NOT_ARMED"
-                                : (inFlight != null ? "IN_FLIGHT"
-                                : (inCooldown ? "COOLDOWN"
-                                : (!canTradeMinute ? "ALREADY_TRADED_THIS_MINUTE"
-                                : "OK")))));
-
-                long cooldownLeft = inCooldown ? (cooldownUntilEpochSecond - nowEpochSecond) : 0;
-                log.accept("🧩 GATE " + ldt
-                        + " reason=" + reason
-                        + " dir=" + direction
-                        + " streak=" + directionStreak
-                        + " armed=" + armed
-                        + " inFlight=" + (inFlight == null ? "no" : ("yes(seq=" + inFlight.tradeSeq() + ")"))
-                        + " cooldownLeftSec=" + cooldownLeft
-                );
-            }
+            // IMPORTANT: read previous lastSeen BEFORE updating it with "now"
+            Long prevSeen = lastSeenEpochByLevel.get(level, nowEpochSecond);
 
             if (warmedUp
                     && !stopped
@@ -210,10 +185,9 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                     && armed
                     && inFlight == null
                     && !inCooldown
-                    && canTradeMinute) {
+                    && canTradeThisMinuteLocked(nowEpochSecond)) {
 
-                Long lastSeen = lastSeenEpochByLevel.get(level);
-                boolean okByRepeatRule = (lastSeen == null) || (nowEpochSecond - lastSeen > LEVEL_REPEAT_MAX_AGE_SECONDS);
+                boolean okByRepeatRule = (prevSeen == null) || (nowEpochSecond - prevSeen > LEVEL_REPEAT_MAX_AGE_SECONDS);
 
                 if (okByRepeatRule) {
                     StakeSnapshot stake = snapshotStakeLocked();
@@ -239,7 +213,7 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                             ldt,
                             symbol,
                             level,
-                            lastSeen,
+                            prevSeen, // keep previous value for logging
                             contract,
                             stake,
                             durationSeconds
@@ -250,6 +224,7 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
             lastProcessedEpochSecond = nowEpochSecond;
             lastProcessedLevel = level;
 
+            // Update "seen" AFTER decision was made
             lastSeenEpochByLevel.put(level, nowEpochSecond);
         }
 
@@ -268,13 +243,8 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                     + " dir=" + direction
                     + " streak=" + directionStreak
                     + " stakePerSide=" + plan.stake().stakePerSide()
-                    + " total=" + plan.stake().stakePerSide().multiply(BigDecimal.valueOf(2))
                     + " ladderIdx=" + plan.stake().ladderIdxAtSend()
                     + " durationTicks=" + plan.durationSeconds() + DEFAULT_DURATION_UNIT
-                    + " rule=streak>=" + DIR_STREAK_MIN_SECONDS
-                    + " uniqueLevelAge>" + LEVEL_REPEAT_MAX_AGE_SECONDS
-                    + " window=" + String.format("%02d", ACTIVE_WINDOW_SEC_FROM) + ".." + String.format("%02d", ACTIVE_WINDOW_SEC_TO)
-                    + " warmupNeedSec=" + MIN_HISTORY_SECONDS_BEFORE_TRADING
                     + " cooldownUntilEpoch=" + cooldownUntilEpochSecond);
 
             CompletableFuture<DerivTradingService.BuySellResult> fut = trading.buySellAndAwait(plan.contract());
@@ -305,6 +275,7 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
     }
 
     private void applyResult(TradePlan plan, DerivTradingService.BuySellResult res, Throwable ex) {
+        long resultEpoch = Instant.now().getEpochSecond();
         LocalDateTime ldt = LocalDateTime.now(zone);
 
         Throwable rootEx = (ex == null) ? null : unwrapCompletion(ex);
@@ -316,6 +287,8 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
         int newIdx;
         boolean failOnLastStep;
         long cooldownUntil;
+
+        String timelineRle;
 
         synchronized (this) {
             if (plan.tradeSeq() <= lastSettledTradeSeq) {
@@ -349,10 +322,8 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                 ladderIdx = 0;
             } else {
                 ladderIdx = Math.min(ladderIdx + 1, LADDER.length - 1);
-
-                // cooldown starts from RESULT time, not from plan time
-                long nowSec = Instant.now().getEpochSecond();
-                cooldownUntilEpochSecond = Math.max(cooldownUntilEpochSecond, nowSec + COOLDOWN_AFTER_FAIL_SECONDS);
+                // cooldown starts from RESULT time
+                cooldownUntilEpochSecond = Math.max(cooldownUntilEpochSecond, resultEpoch + COOLDOWN_AFTER_FAIL_SECONDS);
             }
 
             newIdx = ladderIdx;
@@ -363,7 +334,35 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                 stopReason = (rootEx != null ? "LAST_STEP_ERROR->FAIL" : "LAST_STEP_FAIL");
                 stopAt = ldt;
             }
+
+            // Snapshot last 600 sec ending at RESULT time (sliding tape; no clearing)
+            timelineRle = tape.snapshotLastRleJsonWithTimestamps(resultEpoch);
         }
+
+        // Dataset record: ONE line per closed trade
+        recorder.recordTradeClosed(
+                resultEpoch,
+                plan.symbol(),
+                plan.tradeSeq(),
+
+                plan.epochSecond(),
+                plan.durationSeconds(),
+
+                DEFAULT_STAKE_TYPE,
+                plan.stake().stakePerSide().toPlainString(),
+                plan.stake().ladderIdxAtSend(),
+                prevIdx,
+                newIdx,
+                LADDER[newIdx].toPlainString(),
+
+                success ? "SUCCESS" : "FAIL",
+                (rootEx == null ? null : rootEx.toString()),
+                cooldownUntil,
+
+                resultEpoch,
+                TAPE_KEEP_SECONDS,
+                timelineRle
+        );
 
         if (failOnLastStep) {
             log.accept("🟥 STOP_TRADING"
@@ -498,25 +497,6 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
         return snap.last();
     }
 
-    private void maybePurgeLastSeenLevels(long nowEpochSecond) {
-        long prev = lastSeenPurgeEpoch.get();
-        if (prev == nowEpochSecond) {
-            return;
-        }
-        if (!lastSeenPurgeEpoch.compareAndSet(prev, nowEpochSecond)) {
-            return;
-        }
-
-        long minEpochInclusive = nowEpochSecond - (TAPE_KEEP_SECONDS - 1L);
-
-        for (var e : lastSeenEpochByLevel.entrySet()) {
-            Long lastSeen = e.getValue();
-            if (lastSeen != null && lastSeen < minEpochInclusive) {
-                lastSeenEpochByLevel.remove(e.getKey(), lastSeen);
-            }
-        }
-    }
-
     private record StakeSnapshot(int ladderIdxAtSend, BigDecimal stakePerSide) {}
 
     private record InFlightTrade(
@@ -539,38 +519,39 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
             int durationSeconds
     ) {}
 
-    private static final class GlobalLevelTape {
-        private final int keepSeconds;
-        private final ConcurrentMap<Long, Long> byEpoch = new ConcurrentHashMap<>();
+    /**
+     * TTL map for (level -> lastSeenEpoch), purged by horizon.
+     * Thread-safe (CHM). Purge is throttled to once per epochSecond.
+     */
+    private static final class LongLongTtlMap {
+        private final int horizonSec;
+        private final java.util.concurrent.ConcurrentHashMap<Long, Long> map = new java.util.concurrent.ConcurrentHashMap<>();
         private final AtomicLong lastPurgeEpoch = new AtomicLong(-1);
 
-        private GlobalLevelTape(int keepSeconds) {
-            this.keepSeconds = keepSeconds;
+        private LongLongTtlMap(int horizonSec) {
+            this.horizonSec = horizonSec;
         }
 
-        void put(long epochSecond, long level) {
-            byEpoch.put(epochSecond, level);
+        void put(long level, long epochSecond) {
+            map.put(level, epochSecond);
             maybePurge(epochSecond);
         }
 
-        @SuppressWarnings("unused")
-        Long get(long epochSecond) {
-            return byEpoch.get(epochSecond);
+        Long get(long level, long nowEpochSecond) {
+            maybePurge(nowEpochSecond);
+            return map.get(level);
         }
 
         private void maybePurge(long nowEpochSecond) {
             long prev = lastPurgeEpoch.get();
-            if (prev == nowEpochSecond) {
-                return;
-            }
-            if (!lastPurgeEpoch.compareAndSet(prev, nowEpochSecond)) {
-                return;
-            }
+            if (prev == nowEpochSecond) return;
+            if (!lastPurgeEpoch.compareAndSet(prev, nowEpochSecond)) return;
 
-            long minEpochInclusive = nowEpochSecond - (keepSeconds - 1L);
-            for (Long key : byEpoch.keySet()) {
-                if (key < minEpochInclusive) {
-                    byEpoch.remove(key);
+            long minEpochInclusive = nowEpochSecond - (horizonSec - 1L);
+            for (var e : map.entrySet()) {
+                Long lastSeen = e.getValue();
+                if (lastSeen != null && lastSeen < minEpochInclusive) {
+                    map.remove(e.getKey(), lastSeen);
                 }
             }
         }
