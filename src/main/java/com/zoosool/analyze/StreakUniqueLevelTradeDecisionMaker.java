@@ -41,7 +41,7 @@ import java.util.function.Consumer;
  */
 public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionMaker {
 
-    private static final String ALLOWED_SYMBOL = "stpRNG4";
+    private static final String ALLOWED_SYMBOL = "stpRNG";
 
     private static final BigDecimal[] LADDER = {
             BigDecimal.valueOf(1),
@@ -124,6 +124,10 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
 
     @Override
     public void decideAndTrade(String symbol, AnalyzeContainer analyze) {
+        if (true) {
+            return;
+        }
+
         if (!ALLOWED_SYMBOL.equals(symbol)) {
             return;
         }
