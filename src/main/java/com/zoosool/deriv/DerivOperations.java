@@ -7,4 +7,6 @@ public interface DerivOperations {
     void buy(Contract contract);
     void buySell(Contract contract);
     void buySellS(Contract contract);
+    void buySellD(Contract contract);
+    void sellBuyD(Contract contract);
 }

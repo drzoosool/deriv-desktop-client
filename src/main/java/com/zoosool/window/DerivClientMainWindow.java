@@ -30,10 +30,12 @@ public class DerivClientMainWindow {
     private final ComboBox<Integer> selectorDurationTicks = new ComboBox<>(observableArrayList(2, 4, 6, 8, 10, 15, 17, 19, 35, 43, 57, 61));
     private final ComboBox<String> selectorBasis = new ComboBox<>(observableArrayList("payout", "stake"));
 
-    private final Button buyButton = new Button("BUY");
-    private final Button sellButton = new Button("SELL");
-    private final Button buySellButton = new Button("BUY/SELL");
+    private final Button buyButton        = new Button("BUY");
+    private final Button sellButton       = new Button("SELL");
+    private final Button buySellButton    = new Button("BUY/SELL");
     private final Button buySellSmartButton = new Button("BUY/SELL/s");
+    private final Button buySellDButton   = new Button("BUY/SELL/d");
+    private final Button sellBuyDButton   = new Button("SELL/BUY/d");
 
     private static final String DURATION_UNIT_T = "t";
     private static final String DURATION_UNIT_S = "s";
@@ -42,13 +44,12 @@ public class DerivClientMainWindow {
         this.operations = operations;
         this.logView = logView;
 
-        // Root styling (dark background)
         visualArea.setPadding(new Insets(14));
         visualArea.setStyle("""
                 -fx-background-color: #0f172a;
                 """);
 
-        // Header (title + currency)
+        // Header
         HBox header = new HBox(10);
         header.setAlignment(Pos.CENTER_LEFT);
         header.setPadding(new Insets(10, 12, 10, 12));
@@ -91,7 +92,7 @@ public class DerivClientMainWindow {
 
         header.getChildren().addAll(title, badge, spacer, status);
 
-        // Card container for form + actions
+        // Card
         VBox card = new VBox(12);
         card.setPadding(new Insets(12));
         card.setStyle("""
@@ -109,7 +110,7 @@ public class DerivClientMainWindow {
                 -fx-font-weight: 700;
                 """);
 
-        // Form grid (2 columns)
+        // Form grid
         GridPane form = new GridPane();
         form.setHgap(10);
         form.setVgap(10);
@@ -124,10 +125,8 @@ public class DerivClientMainWindow {
 
         form.getColumnConstraints().addAll(c1, c2);
 
-        // ----- Data from session
         List<ActiveSymbol> activeSymbols = derivSession.stepIndices();
 
-        // ---- Current asset selector (mandatory) ----
         selectorCurrentAsset.getItems().setAll(activeSymbols);
         selectorCurrentAsset.setEditable(false);
 
@@ -154,7 +153,6 @@ public class DerivClientMainWindow {
             }
         });
 
-        // Default selection (first item), enforce non-null value
         if (!activeSymbols.isEmpty()) {
             selectorCurrentAsset.getSelectionModel().selectFirst();
         }
@@ -164,12 +162,10 @@ public class DerivClientMainWindow {
             }
         });
 
-        // Common control styling / sizing
         styleComboBox(selectorCurrentAsset);
         styleComboBox(selectorBasis);
         styleComboBox(selectorDurationTicks);
 
-        // Fix: selected text was black-on-dark (apply dark cell styles)
         applyDarkComboBoxCells(selectorBasis);
         applyDarkComboBoxCells(selectorDurationTicks);
 
@@ -185,21 +181,18 @@ public class DerivClientMainWindow {
         stakeField.setPrefHeight(34);
         stakeField.setStyle(inputStyle());
 
-        // Duration selector (mandatory)
         selectorDurationTicks.getSelectionModel().selectFirst();
         selectorDurationTicks.setEditable(false);
         selectorDurationTicks.valueProperty().addListener((obs, oldV, newV) -> {
             if (newV == null) selectorDurationTicks.setValue(oldV != null ? oldV : 2);
         });
 
-        // Basis selector (mandatory)
         selectorBasis.getSelectionModel().selectFirst();
         selectorBasis.setEditable(false);
         selectorBasis.valueProperty().addListener((obs, oldV, newV) -> {
             if (newV == null) selectorBasis.setValue(oldV != null ? oldV : "payout");
         });
 
-        // Form rows
         form.add(fieldLabel("Current asset"), 0, 0);
         form.add(selectorCurrentAsset, 1, 0);
 
@@ -212,13 +205,18 @@ public class DerivClientMainWindow {
         form.add(fieldLabel("Stake"), 0, 3);
         form.add(stakeField, 1, 3);
 
-        // Buttons row
-        HBox buttons = new HBox(10, buySellSmartButton, buySellButton, buyButton, sellButton);
-        buttons.setAlignment(Pos.CENTER_LEFT);
+        // Buttons — два ряда
+        HBox buttons1 = new HBox(10, buySellSmartButton, buySellButton, buyButton, sellButton);
+        buttons1.setAlignment(Pos.CENTER_LEFT);
+
+        HBox buttons2 = new HBox(10, buySellDButton, sellBuyDButton);
+        buttons2.setAlignment(Pos.CENTER_LEFT);
+
+        VBox buttonsBox = new VBox(8, buttons1, buttons2);
 
         styleButtons();
 
-        // Handlers (unchanged logic + symbol kept in Contract)
+        // Handlers
         buyButton.setOnAction(e -> {
             BigDecimal stake = parseStakeOrLog();
             if (stake == null) return;
@@ -264,6 +262,53 @@ public class DerivClientMainWindow {
 
             stakeField.clear();
         });
+
+        buySellDButton.setOnAction(e -> {
+            BigDecimal stake = parseStakeOrLog();
+            if (stake == null) return;
+
+            ActiveSymbol asset = selectorCurrentAsset.getValue();
+            if (asset == null) {
+                logView.log("Current asset is not selected");
+                return;
+            }
+
+            logView.log("BUY SELL D clicked. stake=" + stake + ", asset=" + asset.symbol());
+
+            this.operations.buySellD(new Contract(
+                    asset.symbol(),
+                    stake,
+                    selectorDurationTicks.getValue(),
+                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
+                    selectorBasis.getValue()
+            ));
+
+            stakeField.clear();
+        });
+
+        sellBuyDButton.setOnAction(e -> {
+            BigDecimal stake = parseStakeOrLog();
+            if (stake == null) return;
+
+            ActiveSymbol asset = selectorCurrentAsset.getValue();
+            if (asset == null) {
+                logView.log("Current asset is not selected");
+                return;
+            }
+
+            logView.log("SELL BUY D clicked. stake=" + stake + ", asset=" + asset.symbol());
+
+            this.operations.sellBuyD(new Contract(
+                    asset.symbol(),
+                    stake,
+                    selectorDurationTicks.getValue(),
+                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
+                    selectorBasis.getValue()
+            ));
+
+            stakeField.clear();
+        });
+
 
         buySellButton.setOnAction(e -> {
             BigDecimal stake = parseStakeOrLog();
@@ -313,7 +358,7 @@ public class DerivClientMainWindow {
             stakeField.clear();
         });
 
-        // Log (wrap into a titled pane to look cleaner)
+        // Log
         VBox logBox = new VBox(8);
         logBox.setPadding(new Insets(10));
         logBox.setStyle("""
@@ -331,7 +376,7 @@ public class DerivClientMainWindow {
                 -fx-text-fill: white;
                 """);
 
-        card.getChildren().addAll(cardTitle, form, buttons);
+        card.getChildren().addAll(cardTitle, form, buttonsBox);
         visualArea.getChildren().addAll(header, statsView.getNode(), card, logPane);
     }
 
@@ -360,19 +405,25 @@ public class DerivClientMainWindow {
 
     private void styleButtons() {
         stylePrimary(buySellSmartButton, "#7c3aaa");
-        stylePrimary(buySellButton, "#7c3aed"); // violet
-        stylePrimary(buyButton, "#22c55e");     // green
-        stylePrimary(sellButton, "#ef4444");    // red
+        stylePrimary(buySellButton,      "#7c3aed");
+        stylePrimary(buyButton,          "#22c55e");
+        stylePrimary(sellButton,         "#ef4444");
+        stylePrimary(buySellDButton,     "#0ea5e9");
+        stylePrimary(sellBuyDButton,     "#f97316");
 
         buySellSmartButton.setPrefHeight(36);
         buySellButton.setPrefHeight(36);
         buyButton.setPrefHeight(36);
         sellButton.setPrefHeight(36);
+        buySellDButton.setPrefHeight(36);
+        sellBuyDButton.setPrefHeight(36);
 
         buySellSmartButton.setMinWidth(120);
         buySellButton.setMinWidth(120);
         buyButton.setMinWidth(90);
         sellButton.setMinWidth(90);
+        buySellDButton.setMinWidth(120);
+        sellBuyDButton.setMinWidth(120);
     }
 
     private void stylePrimary(Button b, String color) {

@@ -16,7 +16,7 @@ import java.util.function.Consumer;
 
 public final class DerivTradingService {
 
-    private static final long AWAIT_POLL_PERIOD_MILLIS = 1_000;
+    private static final long AWAIT_POLL_PERIOD_MILLIS = 10_000;
 
     private static final long AWAIT_TIMEOUT_MILLIS = 10 * 60_000L;
 
@@ -57,7 +57,28 @@ public final class DerivTradingService {
         CompletableFuture<Long> up = buyRise(contract);
         CompletableFuture<Long> down = buyFall(contract);
 
-        return up.thenCombine(down, (a, b) -> null);
+        return up.thenCombine(down, (callId, putId) -> new long[]{callId, putId})
+                .thenCompose(ids -> awaitBothSoldRetryForever(contract.symbol(), ids[0], ids[1]))
+                .thenCompose(ignored -> fetchAndLogBalance())
+                .thenApply(ignored -> null);
+    }
+
+    private CompletableFuture<Void> fetchAndLogBalance() {
+        ObjectNode req = mapper.createObjectNode();
+        req.put("balance", 1);
+        req.put("req_id", reqSeq.getAndIncrement());
+
+        return ws().sendRequest(req)
+                .thenAccept(resp -> {
+                    JsonNode b = resp.path("balance");
+                    String amount   = b.path("balance").asText("?");
+                    String currency = b.path("currency").asText("?");
+                    log.accept("💰CURRENT BALANCE " + currency + " " + amount);
+                })
+                .exceptionally(ex -> {
+                    log.accept("🟧 BALANCE fetch failed: " + formatErr(ex));
+                    return null;
+                });
     }
 
     public void shutdown() {
@@ -120,7 +141,7 @@ public final class DerivTradingService {
         });
     }
 
-    private CompletableFuture<Void> delay(long millis) {
+    public CompletableFuture<Void> delay(long millis) {
         if (millis <= 0) return CompletableFuture.completedFuture(null);
 
         CompletableFuture<Void> cf = new CompletableFuture<>();
