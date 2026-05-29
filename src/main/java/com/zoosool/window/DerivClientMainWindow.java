@@ -4,8 +4,8 @@ import com.zoosool.deriv.DerivOperations;
 import com.zoosool.model.ActiveSymbol;
 import com.zoosool.model.Contract;
 import com.zoosool.model.DerivSession;
+import com.zoosool.safari.SafariBridge;
 import com.zoosool.state.TradeWindowState;
-import javafx.application.Platform;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Parent;
@@ -23,7 +23,6 @@ public class DerivClientMainWindow {
 
     private final DerivOperations operations;
     private final AppLogView logView;
-    private final TradeWindowState state;
 
     private final VBox visualArea = new VBox(10);
 
@@ -41,14 +40,10 @@ public class DerivClientMainWindow {
     private static final String DURATION_UNIT_T = "t";
     private static final String DURATION_UNIT_S = "s";
 
-    private static final String CHART_BASE_URL =
-            "https://app.deriv.com/dtrader?action=redirect&redirect_to=accumulator&account=demo&lang=ru&trade_type=multiplier&chart_type=area&interval=1t&symbol=";
-
     public DerivClientMainWindow(DerivOperations operations, DerivSession derivSession, AppLogView logView, TickStatsView statsView,
-                                 TradeWindowState state) {
+                                 TradeWindowState state, SafariBridge safariBridge) {
         this.operations = operations;
         this.logView = logView;
-        this.state = state;
 
         visualArea.setPadding(new Insets(14));
         visualArea.setStyle("""
@@ -171,9 +166,7 @@ public class DerivClientMainWindow {
             } else {
                 state.setSelectedAsset(newV);
                 if (initialized[0]) {
-                    if (state.isRedirectEnabled()) {
-                        openChartInSafari(newV.symbol());
-                    }
+                    safariBridge.redirectIfEnabled(newV.symbol());
                 } else {
                     initialized[0] = true;
                 }
@@ -411,26 +404,6 @@ public class DerivClientMainWindow {
 
     public Parent getVisualArea() {
         return visualArea;
-    }
-
-    private void openChartInSafari(String symbol) {
-        String script = "tell application \"Safari\" to set URL of current tab of front window to \"%s\""
-                .formatted(CHART_BASE_URL + symbol);
-
-        new Thread(() -> {
-            try {
-                ProcessBuilder pb = new ProcessBuilder("osascript", "-e", script);
-                pb.redirectErrorStream(true);
-                Process process = pb.start();
-                int exitCode = process.waitFor();
-                if (exitCode != 0) {
-                    String error = new String(process.getInputStream().readAllBytes());
-                    Platform.runLater(() -> logView.log("Safari error: " + error));
-                }
-            } catch (Exception e) {
-                Platform.runLater(() -> logView.log("Safari bridge error: " + e.getMessage()));
-            }
-        }).start();
     }
 
     private BigDecimal parseStakeOrLog() {

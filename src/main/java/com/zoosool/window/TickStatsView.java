@@ -5,6 +5,8 @@ import com.zoosool.analyze.TickStatsSink;
 import com.zoosool.enums.TickDecision;
 import com.zoosool.enums.TickStatsState;
 import com.zoosool.model.TickStatsSnapshot;
+import com.zoosool.safari.SafariBridge;
+import com.zoosool.state.TradeWindowState;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -20,30 +22,20 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.function.Consumer;
 
-/**
- * One row per symbol. Columns are aligned to window width (percent widths).
- * Rows are kept sorted alphabetically by symbol.
- * Updates are thread-safe via uiExecutor (Platform::runLater).
- *
- * Reset behavior:
- * - Does NOT remove rows from UI.
- * - Only clears per-row values to placeholders.
- * This avoids "UI disappears on disconnect" and removes the need for reset dedup logic.
- */
 public final class TickStatsView implements TickStatsSink, Resetable {
 
+    private final SafariBridge safariBridge;
     private final Consumer<Runnable> ui;
 
     private final VBox root = new VBox(6);
     private final VBox rowsBox = new VBox(4);
 
-    // We keep rows here; visual order is maintained separately in rowsBox.
     private final Map<String, RowUi> rowsBySymbol = new LinkedHashMap<>();
 
-    // Alphabetical, case-insensitive (stpRNG2/stpRNG10 won't be "natural", but ok for now).
     private static final Comparator<String> SYMBOL_ORDER = String.CASE_INSENSITIVE_ORDER;
 
-    public TickStatsView(Consumer<Runnable> uiExecutor) {
+    public TickStatsView(Consumer<Runnable> uiExecutor, SafariBridge safariBridge) {
+        this.safariBridge = Objects.requireNonNull(safariBridge, "safariBridge");
         this.ui = Objects.requireNonNull(uiExecutor, "uiExecutor");
         buildUi();
     }
@@ -74,7 +66,6 @@ public final class TickStatsView implements TickStatsSink, Resetable {
         List<Node> children = rowsBox.getChildren();
         int idx = 0;
 
-        // Find insertion index by comparing against existing row symbols.
         while (idx < children.size()) {
             Node n = children.get(idx);
             if (n instanceof GridPane gp) {
@@ -167,19 +158,11 @@ public final class TickStatsView implements TickStatsSink, Resetable {
         return l;
     }
 
-    /**
-     * Reset = clear values only (keep rows).
-     * This prevents "only last row left" effects during reconnect storms.
-     */
     @Override
     public void reset() {
         ui.accept(() -> rowsBySymbol.values().forEach(RowUi::clearValues));
     }
 
-    /**
-     * If you ever truly need a full wipe (e.g., symbol list changed),
-     * call this explicitly from connector/controller, NOT from per-symbol calculators.
-     */
     public void clearAllRows() {
         ui.accept(() -> {
             rowsBySymbol.clear();
@@ -192,12 +175,12 @@ public final class TickStatsView implements TickStatsSink, Resetable {
 
         final String symbolText;
 
-        final Label symbol = cellText("—", true);
-        final Label state = badge("—");
+        final Label symbol   = cellText("—", true);
+        final Label state    = badge("—");
         final Label decision = badge("—");
-        final Label adl = cellText("NA/NA", true);
-        final Label xma = cellText("NA/NA", true);
-        final Label zS = cellText("0", true);
+        final Label adl      = cellText("NA/NA", true);
+        final Label xma      = cellText("NA/NA", true);
+        final Label zS       = cellText("0", true);
 
         RowUi(String symbolText) {
             this.symbolText = Objects.requireNonNull(symbolText, "symbolText");
@@ -208,19 +191,22 @@ public final class TickStatsView implements TickStatsSink, Resetable {
 
             symbol.setText(this.symbolText);
 
-            grid.add(symbol, 0, 0);
-            grid.add(state, 1, 0);
-            grid.add(decision, 2, 0);
-            grid.add(adl, 3, 0);
-            grid.add(xma, 4, 0);
-            grid.add(zS, 5, 0);
+            adl.setStyle(adl.getStyle() + "-fx-cursor: hand;");
+            adl.setOnMouseClicked(e -> safariBridge.redirectIfEnabled(this.symbolText));
 
-            GridPane.setFillWidth(symbol, true);
-            GridPane.setFillWidth(state, true);
+            grid.add(symbol,   0, 0);
+            grid.add(state,    1, 0);
+            grid.add(decision, 2, 0);
+            grid.add(adl,      3, 0);
+            grid.add(xma,      4, 0);
+            grid.add(zS,       5, 0);
+
+            GridPane.setFillWidth(symbol,   true);
+            GridPane.setFillWidth(state,    true);
             GridPane.setFillWidth(decision, true);
-            GridPane.setFillWidth(adl, true);
-            GridPane.setFillWidth(xma, true);
-            GridPane.setFillWidth(zS, true);
+            GridPane.setFillWidth(adl,      true);
+            GridPane.setFillWidth(xma,      true);
+            GridPane.setFillWidth(zS,       true);
 
             state.setMaxWidth(Double.MAX_VALUE);
             decision.setMaxWidth(Double.MAX_VALUE);
@@ -240,7 +226,6 @@ public final class TickStatsView implements TickStatsSink, Resetable {
         }
 
         void clearValues() {
-            // Keep symbol text, clear everything else.
             setBadge(state, "—", "rgba(255,255,255,0.10)");
             setBadge(decision, "—", "rgba(255,255,255,0.10)");
             adl.setText("NA/NA");
@@ -295,19 +280,19 @@ public final class TickStatsView implements TickStatsSink, Resetable {
     private static String decisionColor(TickDecision d) {
         if (d == null) return "rgba(255,255,255,0.10)";
         return switch (d) {
-            case TRADE -> "rgba(34,197,94,0.22)";
-            case CAUTION -> "rgba(234,179,8,0.22)";
+            case TRADE    -> "rgba(34,197,94,0.22)";
+            case CAUTION  -> "rgba(234,179,8,0.22)";
             case NO_TRADE -> "rgba(239,68,68,0.22)";
-            case NA -> "rgba(255,255,255,0.10)";
+            case NA       -> "rgba(255,255,255,0.10)";
         };
     }
 
     private static String stateColor(TickStatsState s) {
         if (s == null) return "rgba(255,255,255,0.10)";
         return switch (s) {
-            case OK -> "rgba(34,197,94,0.18)";
-            case WARMUP_L, WARMUP_S -> "rgba(148,163,184,0.18)";
-            case BANNED -> "rgba(239,68,68,0.18)";
+            case OK                  -> "rgba(34,197,94,0.18)";
+            case WARMUP_L, WARMUP_S  -> "rgba(148,163,184,0.18)";
+            case BANNED              -> "rgba(239,68,68,0.18)";
         };
     }
 
