@@ -5,26 +5,24 @@ import com.zoosool.analyze.TickStatsSink;
 import com.zoosool.enums.TickDecision;
 import com.zoosool.enums.TickStatsState;
 import com.zoosool.model.TickStatsSnapshot;
-import com.zoosool.safari.SafariBridge;
 import com.zoosool.state.TradeWindowState;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
 import javafx.scene.control.Label;
-import javafx.scene.layout.*;
+import javafx.scene.layout.ColumnConstraints;
+import javafx.scene.layout.GridPane;
+import javafx.scene.layout.Priority;
+import javafx.scene.layout.VBox;
 import javafx.scene.text.Font;
 
-import java.util.Comparator;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 import java.util.function.Consumer;
 
 public final class TickStatsView implements TickStatsSink, Resetable {
 
-    private final SafariBridge safariBridge;
+    private final TradeWindowState tradeWindowState;
     private final Consumer<Runnable> ui;
 
     private final VBox root = new VBox(6);
@@ -34,8 +32,8 @@ public final class TickStatsView implements TickStatsSink, Resetable {
 
     private static final Comparator<String> SYMBOL_ORDER = String.CASE_INSENSITIVE_ORDER;
 
-    public TickStatsView(Consumer<Runnable> uiExecutor, SafariBridge safariBridge) {
-        this.safariBridge = Objects.requireNonNull(safariBridge, "safariBridge");
+    public TickStatsView(Consumer<Runnable> uiExecutor, TradeWindowState tradeWindowState) {
+        this.tradeWindowState = Objects.requireNonNull(tradeWindowState, "tradeWindowState");
         this.ui = Objects.requireNonNull(uiExecutor, "uiExecutor");
         buildUi();
     }
@@ -192,7 +190,12 @@ public final class TickStatsView implements TickStatsSink, Resetable {
             symbol.setText(this.symbolText);
 
             adl.setStyle(adl.getStyle() + "-fx-cursor: hand;");
-            adl.setOnMouseClicked(e -> safariBridge.redirectIfEnabled(this.symbolText));
+            adl.setOnMouseClicked(e -> {
+                tradeWindowState.getSymbols().stream()
+                        .filter(s -> s.symbol().equals(this.symbolText))
+                        .findFirst()
+                        .ifPresent(tradeWindowState::setSelectedAsset);
+            });
 
             grid.add(symbol,   0, 0);
             grid.add(state,    1, 0);

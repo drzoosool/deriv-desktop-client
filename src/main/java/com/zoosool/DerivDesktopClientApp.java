@@ -63,7 +63,7 @@ public class DerivDesktopClientApp extends Application {
         StreakFourFixedDurationTradeDecisionMaker noFilterTradeDecisionMaker =
                 new StreakFourFixedDurationTradeDecisionMaker(trading, balanceHolder, appLogView.logger(), tradeWindowState);
 
-        TickStatsView statsView = new TickStatsView(Platform::runLater, safariBridge);
+        TickStatsView statsView = new TickStatsView(Platform::runLater, tradeWindowState);
         TickDecisionEngineSink tickDecisionEngineSink = new TickDecisionEngineSink(statsView, noFilterTradeDecisionMaker);
         TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, tickDecisionEngineSink);
 
@@ -92,6 +92,8 @@ public class DerivDesktopClientApp extends Application {
 
 
         DerivSession derivSession = connector.ping().join();
+        tradeWindowState.setSymbols(derivSession.activeSymbols());
+
         derivCurrencyHolder.setCurrency(derivSession.currency());
         derivConnectorHolder.setConnector(connector);
 

@@ -6,6 +6,7 @@ import com.zoosool.model.Contract;
 import com.zoosool.model.DerivSession;
 import com.zoosool.safari.SafariBridge;
 import com.zoosool.state.TradeWindowState;
+import javafx.application.Platform;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Parent;
@@ -23,6 +24,8 @@ public class DerivClientMainWindow {
 
     private final DerivOperations operations;
     private final AppLogView logView;
+    private final TradeWindowState state;
+    private final SafariBridge safariBridge;
 
     private final VBox visualArea = new VBox(10);
 
@@ -42,8 +45,10 @@ public class DerivClientMainWindow {
 
     public DerivClientMainWindow(DerivOperations operations, DerivSession derivSession, AppLogView logView, TickStatsView statsView,
                                  TradeWindowState state, SafariBridge safariBridge) {
-        this.operations = operations;
-        this.logView = logView;
+        this.operations   = operations;
+        this.logView      = logView;
+        this.state        = state;
+        this.safariBridge = safariBridge;
 
         visualArea.setPadding(new Insets(14));
         visualArea.setStyle("""
@@ -126,8 +131,8 @@ public class DerivClientMainWindow {
 
         form.getColumnConstraints().addAll(c1, c2);
 
+        // ── Asset selector ──────────────────────────────────────────────
         List<ActiveSymbol> activeSymbols = derivSession.stepIndices();
-
         selectorCurrentAsset.getItems().setAll(activeSymbols);
         selectorCurrentAsset.setEditable(false);
 
@@ -154,25 +159,89 @@ public class DerivClientMainWindow {
             }
         });
 
-        if (!activeSymbols.isEmpty()) {
-            selectorCurrentAsset.getSelectionModel().selectFirst();
-            state.setSelectedAsset(activeSymbols.get(0));
-        }
-
-        final boolean[] initialized = {false};
+        // UI → State: юзер выбрал асет в комбобоксе
         selectorCurrentAsset.valueProperty().addListener((obs, oldV, newV) -> {
             if (newV == null) {
                 selectorCurrentAsset.setValue(oldV != null ? oldV : (activeSymbols.isEmpty() ? null : activeSymbols.get(0)));
-            } else {
+            } else if (!newV.equals(state.getSelectedAsset())) {
                 state.setSelectedAsset(newV);
-                if (initialized[0]) {
-                    safariBridge.redirectIfEnabled(newV.symbol());
-                } else {
-                    initialized[0] = true;
-                }
             }
         });
 
+        // State → UI: стейт изменился (например клик в TickStatsView) → обновляем комбобокс
+        state.selectedAssetProperty().addListener((obs, oldV, newV) -> {
+            if (newV == null) return;
+            if (!newV.equals(selectorCurrentAsset.getValue())) {
+                Platform.runLater(() -> selectorCurrentAsset.setValue(newV));
+            }
+            safariBridge.redirectIfEnabled();
+        });
+
+        // инициализируем стейт первым значением
+        if (!activeSymbols.isEmpty()) {
+            state.setSelectedAsset(activeSymbols.get(0));
+        }
+
+        // ── Basis selector ──────────────────────────────────────────────
+        selectorBasis.getSelectionModel().selectFirst();
+        selectorBasis.setEditable(false);
+
+        // UI → State
+        selectorBasis.valueProperty().addListener((obs, oldV, newV) -> {
+            if (newV == null) {
+                selectorBasis.setValue(oldV != null ? oldV : "payout");
+            } else if (!newV.equals(state.getBasis())) {
+                state.setBasis(newV);
+            }
+        });
+
+        // State → UI
+        state.basisProperty().addListener((obs, oldV, newV) -> {
+            if (newV != null && !newV.equals(selectorBasis.getValue())) {
+                Platform.runLater(() -> selectorBasis.setValue(newV));
+            }
+        });
+
+        // ── Duration selector ───────────────────────────────────────────
+        selectorDurationTicks.getSelectionModel().selectFirst();
+        selectorDurationTicks.setEditable(false);
+
+        // UI → State
+        selectorDurationTicks.valueProperty().addListener((obs, oldV, newV) -> {
+            if (newV == null) {
+                selectorDurationTicks.setValue(oldV != null ? oldV : 2);
+            } else if (newV != state.getDuration()) {
+                state.setDuration(newV);
+            }
+        });
+
+        // State → UI
+        state.durationProperty().addListener((obs, oldV, newV) -> {
+            if (newV != null && !newV.equals(selectorDurationTicks.getValue())) {
+                Platform.runLater(() -> selectorDurationTicks.setValue(newV.intValue()));
+            }
+        });
+
+        // ── Stake field ─────────────────────────────────────────────────
+        stakeField.setPromptText("Stake amount");
+        stakeField.setPrefHeight(34);
+        stakeField.setStyle(inputStyle());
+
+        // UI → State
+        stakeField.textProperty().addListener((obs, oldV, newV) -> {
+            if (!newV.equals(state.getStake())) {
+                state.setStake(newV);
+            }
+        });
+
+        // State → UI (например сброс после трейда)
+        state.stakeProperty().addListener((obs, oldV, newV) -> {
+            if (newV != null && !newV.equals(stakeField.getText())) {
+                Platform.runLater(() -> stakeField.setText(newV));
+            }
+        });
+
+        // ── Styles ──────────────────────────────────────────────────────
         styleComboBox(selectorCurrentAsset);
         styleComboBox(selectorBasis);
         styleComboBox(selectorDurationTicks);
@@ -188,30 +257,6 @@ public class DerivClientMainWindow {
         selectorBasis.setMaxWidth(Double.MAX_VALUE);
         selectorDurationTicks.setMaxWidth(Double.MAX_VALUE);
 
-        stakeField.setPromptText("Stake amount");
-        stakeField.setPrefHeight(34);
-        stakeField.setStyle(inputStyle());
-
-        selectorDurationTicks.getSelectionModel().selectFirst();
-        selectorDurationTicks.setEditable(false);
-        selectorDurationTicks.valueProperty().addListener((obs, oldV, newV) -> {
-            if (newV == null) {
-                selectorDurationTicks.setValue(oldV != null ? oldV : 2);
-            } else {
-                state.setDuration(newV);
-            }
-        });
-
-        selectorBasis.getSelectionModel().selectFirst();
-        selectorBasis.setEditable(false);
-        selectorBasis.valueProperty().addListener((obs, oldV, newV) -> {
-            if (newV == null) {
-                selectorBasis.setValue(oldV != null ? oldV : "payout");
-            } else {
-                state.setBasis(newV);
-            }
-        });
-
         form.add(fieldLabel("Current asset"), 0, 0);
         form.add(selectorCurrentAsset, 1, 0);
 
@@ -224,57 +269,57 @@ public class DerivClientMainWindow {
         form.add(fieldLabel("Stake"), 0, 3);
         form.add(stakeField, 1, 3);
 
-        // Auto-trade checkbox
+        // ── Auto-trade checkbox ─────────────────────────────────────────
         CheckBox autoTradeCheckBox = new CheckBox("Enable auto-trade");
-        autoTradeCheckBox.setSelected(false);
-        autoTradeCheckBox.setStyle("""
-                -fx-text-fill: rgba(255,255,255,0.85);
-                -fx-font-size: 12px;
-                """);
+        autoTradeCheckBox.setSelected(state.isAutoTradeEnabled());
+
+        // UI → State
         autoTradeCheckBox.selectedProperty().addListener((obs, oldV, newV) -> {
-            autoTradeCheckBox.setStyle(newV
-                    ? """
-                      -fx-text-fill: rgba(255,255,255,0.85);
-                      -fx-font-size: 12px;
-                      -fx-mark-color: black;
-                      -fx-background-color: white, white, #22c55e;
-                      """
-                    : """
-                      -fx-text-fill: rgba(255,255,255,0.85);
-                      -fx-font-size: 12px;
-                      -fx-mark-color: black;
-                      -fx-background-color: rgba(255,255,255,0.15), rgba(255,255,255,0.15), #1e293b;
-                      """);
-            state.setAutoTradeEnabled(newV);
+            applyCheckBoxStyle(autoTradeCheckBox, newV);
+            if (newV != state.isAutoTradeEnabled()) {
+                state.setAutoTradeEnabled(newV);
+            }
+        });
+
+        // State → UI
+        state.autoTradeEnabledProperty().addListener((obs, oldV, newV) -> {
+            if (newV != autoTradeCheckBox.isSelected()) {
+                Platform.runLater(() -> {
+                    autoTradeCheckBox.setSelected(newV);
+                    applyCheckBoxStyle(autoTradeCheckBox, newV);
+                });
+            }
             logView.log("Auto-trade: " + (newV ? "ENABLED ✅" : "DISABLED ⛔"));
         });
 
-        // Redirect checkbox
+        applyCheckBoxStyle(autoTradeCheckBox, autoTradeCheckBox.isSelected());
+
+        // ── Redirect checkbox ───────────────────────────────────────────
         CheckBox redirectCheckBox = new CheckBox("Enable redirect");
-        redirectCheckBox.setSelected(false);
-        redirectCheckBox.setStyle("""
-                -fx-text-fill: rgba(255,255,255,0.85);
-                -fx-font-size: 12px;
-                """);
+        redirectCheckBox.setSelected(state.isRedirectEnabled());
+
+        // UI → State
         redirectCheckBox.selectedProperty().addListener((obs, oldV, newV) -> {
-            redirectCheckBox.setStyle(newV
-                    ? """
-                      -fx-text-fill: rgba(255,255,255,0.85);
-                      -fx-font-size: 12px;
-                      -fx-mark-color: black;
-                      -fx-background-color: white, white, #22c55e;
-                      """
-                    : """
-                      -fx-text-fill: rgba(255,255,255,0.85);
-                      -fx-font-size: 12px;
-                      -fx-mark-color: black;
-                      -fx-background-color: rgba(255,255,255,0.15), rgba(255,255,255,0.15), #1e293b;
-                      """);
-            state.setRedirectEnabled(newV);
+            applyCheckBoxStyle(redirectCheckBox, newV);
+            if (newV != state.isRedirectEnabled()) {
+                state.setRedirectEnabled(newV);
+            }
+        });
+
+        // State → UI
+        state.redirectEnabledProperty().addListener((obs, oldV, newV) -> {
+            if (newV != redirectCheckBox.isSelected()) {
+                Platform.runLater(() -> {
+                    redirectCheckBox.setSelected(newV);
+                    applyCheckBoxStyle(redirectCheckBox, newV);
+                });
+            }
             logView.log("Redirect: " + (newV ? "ENABLED ✅" : "DISABLED ⛔"));
         });
 
-        // Buttons
+        applyCheckBoxStyle(redirectCheckBox, redirectCheckBox.isSelected());
+
+        // ── Buttons ─────────────────────────────────────────────────────
         HBox buttons = new HBox(10, buySellSmartButton, buySellButton, buyButton, sellButton);
         buttons.setAlignment(Pos.CENTER_LEFT);
 
@@ -285,102 +330,40 @@ public class DerivClientMainWindow {
 
         styleButtons();
 
-        // Handlers
+        // ── Handlers ────────────────────────────────────────────────────
         buyButton.setOnAction(e -> {
-            BigDecimal stake = parseStakeOrLog();
-            if (stake == null) return;
-
-            ActiveSymbol asset = selectorCurrentAsset.getValue();
-            if (asset == null) {
-                logView.log("Current asset is not selected");
-                return;
-            }
-
-            logView.log("BUY clicked. stake=" + stake + ", asset=" + asset.symbol());
-
-            this.operations.buy(new Contract(
-                    asset.symbol(),
-                    stake,
-                    selectorDurationTicks.getValue(),
-                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
-                    selectorBasis.getValue()
-            ));
-
-            stakeField.clear();
+            Contract contract = buildContractOrLog();
+            if (contract == null) return;
+            logView.log("BUY clicked. stake=" + state.getStake() + ", asset=" + state.getSelectedAsset().symbol());
+            this.operations.buy(contract);
+            state.setStake("");
         });
 
         sellButton.setOnAction(e -> {
-            BigDecimal stake = parseStakeOrLog();
-            if (stake == null) return;
-
-            ActiveSymbol asset = selectorCurrentAsset.getValue();
-            if (asset == null) {
-                logView.log("Current asset is not selected");
-                return;
-            }
-
-            logView.log("SELL clicked. stake=" + stake + ", asset=" + asset.symbol());
-
-            this.operations.sell(new Contract(
-                    asset.symbol(),
-                    stake,
-                    selectorDurationTicks.getValue(),
-                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
-                    selectorBasis.getValue()
-            ));
-
-            stakeField.clear();
+            Contract contract = buildContractOrLog();
+            if (contract == null) return;
+            logView.log("SELL clicked. stake=" + state.getStake() + ", asset=" + state.getSelectedAsset().symbol());
+            this.operations.sell(contract);
+            state.setStake("");
         });
 
         buySellButton.setOnAction(e -> {
-            BigDecimal stake = parseStakeOrLog();
-            if (stake == null) return;
-
-            ActiveSymbol asset = selectorCurrentAsset.getValue();
-            if (asset == null) {
-                logView.log("Current asset is not selected");
-                return;
-            }
-
-            logView.log("BUY/SELL clicked. stake=" + stake + ", asset=" + asset.symbol());
-
-            this.operations.buySell(new Contract(
-                    asset.symbol(),
-                    stake,
-                    selectorDurationTicks.getValue(),
-                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
-                    selectorBasis.getValue()
-            ));
-
-            stakeField.clear();
+            Contract contract = buildContractOrLog();
+            if (contract == null) return;
+            logView.log("BUY/SELL clicked. stake=" + state.getStake() + ", asset=" + state.getSelectedAsset().symbol());
+            this.operations.buySell(contract);
+            state.setStake("");
         });
 
         buySellSmartButton.setOnAction(e -> {
-            BigDecimal stake = parseStakeOrLog();
-            if (stake == null) return;
-
-            ActiveSymbol asset = selectorCurrentAsset.getValue();
-            if (asset == null) {
-                logView.log("Current asset is not selected");
-                return;
-            }
-
-            logView.log("BUY/SELL smart clicked. stake=" + stake + ", asset=" + asset.symbol());
-
-            this.operations.buySellS(new Contract(
-                    asset.symbol(),
-                    stake,
-                    (((59 - java.time.LocalDateTime.now().getSecond()) & 1) == 1)
-                            ? (59 - java.time.LocalDateTime.now().getSecond())
-                            : Math.max(1, (59 - java.time.LocalDateTime.now().getSecond()) - 1),
-                    DURATION_UNIT_S,
-                    selectorBasis.getValue()
-            ));
-
-            stakeField.clear();
+            Contract contract = buildSmartContractOrLog();
+            if (contract == null) return;
+            logView.log("BUY/SELL smart clicked. stake=" + state.getStake() + ", asset=" + state.getSelectedAsset().symbol());
+            this.operations.buySellS(contract);
+            state.setStake("");
         });
 
-        // Log
+        // ── Log ──────────────────────────────────────────────────────────
         VBox logBox = new VBox(8);
         logBox.setPadding(new Insets(10));
         logBox.setStyle("""
@@ -406,8 +389,49 @@ public class DerivClientMainWindow {
         return visualArea;
     }
 
+    private Contract buildContractOrLog() {
+        BigDecimal stake = parseStakeOrLog();
+        if (stake == null) return null;
+
+        ActiveSymbol asset = state.getSelectedAsset();
+        if (asset == null) {
+            logView.log("Current asset is not selected");
+            return null;
+        }
+
+        return new Contract(
+                asset.symbol(),
+                stake,
+                state.getDuration(),
+                state.getDuration() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
+                state.getBasis()
+        );
+    }
+
+    private Contract buildSmartContractOrLog() {
+        BigDecimal stake = parseStakeOrLog();
+        if (stake == null) return null;
+
+        ActiveSymbol asset = state.getSelectedAsset();
+        if (asset == null) {
+            logView.log("Current asset is not selected");
+            return null;
+        }
+
+        int sec = java.time.LocalDateTime.now().getSecond();
+        int duration = ((59 - sec) & 1) == 1 ? (59 - sec) : Math.max(1, (59 - sec) - 1);
+
+        return new Contract(
+                asset.symbol(),
+                stake,
+                duration,
+                DURATION_UNIT_S,
+                state.getBasis()
+        );
+    }
+
     private BigDecimal parseStakeOrLog() {
-        String raw = stakeField.getText();
+        String raw = state.getStake();
         if (raw == null || raw.isBlank()) {
             logView.log("Stake is empty");
             return null;
@@ -423,6 +447,22 @@ public class DerivClientMainWindow {
             logView.log("Invalid stake: " + raw);
             return null;
         }
+    }
+
+    private static void applyCheckBoxStyle(CheckBox cb, boolean selected) {
+        cb.setStyle(selected
+                ? """
+                  -fx-text-fill: rgba(255,255,255,0.85);
+                  -fx-font-size: 12px;
+                  -fx-mark-color: black;
+                  -fx-background-color: white, white, #22c55e;
+                  """
+                : """
+                  -fx-text-fill: rgba(255,255,255,0.85);
+                  -fx-font-size: 12px;
+                  -fx-mark-color: black;
+                  -fx-background-color: rgba(255,255,255,0.15), rgba(255,255,255,0.15), #1e293b;
+                  """);
     }
 
     private void styleButtons() {

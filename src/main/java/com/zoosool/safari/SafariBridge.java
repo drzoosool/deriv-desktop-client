@@ -13,9 +13,10 @@ public class SafariBridge {
         this.state = state;
     }
 
-    public void redirectIfEnabled(String symbol) {
+    public void redirectIfEnabled() {
         if (!state.isRedirectEnabled()) return;
-        openInSafari(symbol);
+        if (state.getSelectedAsset() == null) return;
+        openInSafari(state.getSelectedAsset().symbol());
     }
 
     public void openInSafari(String symbol) {
@@ -26,8 +27,7 @@ public class SafariBridge {
             try {
                 ProcessBuilder pb = new ProcessBuilder("osascript", "-e", script);
                 pb.redirectErrorStream(true);
-                Process process = pb.start();
-                process.waitFor();
+                pb.start().waitFor();
             } catch (Exception ignored) {}
         }).start();
     }
