@@ -57,32 +57,6 @@ public class DerivController implements DerivOperations {
                 });
     }
 
-    @Override
-    public void buySellD(Contract contract) {
-        trading.buyRise(contract)
-                .thenCompose(id -> trading.delay(DELAY_TIME_MILLIS))
-                .thenCompose(id -> trading.buyFall(new Contract(contract.symbol(), contract.stake(), contract.durationTicks() - 2,
-                        contract.durationUnit(), contract.basis())))
-                .thenRun(() -> log.accept("BUY+DOWN SMART sent"))
-                .exceptionally(ex -> {
-                    log.accept("BUY+DOWN FAIL: " + rootMessage(ex));
-                    return null;
-                });
-    }
-
-    @Override
-    public void sellBuyD(Contract contract) {
-        trading.buyFall(contract)
-                .thenCompose(id -> trading.delay(DELAY_TIME_MILLIS))
-                .thenCompose(id -> trading.buyRise(new Contract(contract.symbol(), contract.stake(), contract.durationTicks() - 2,
-                        contract.durationUnit(), contract.basis())))
-                .thenRun(() -> log.accept("BUY+DOWN SMART sent"))
-                .exceptionally(ex -> {
-                    log.accept("BUY+DOWN FAIL: " + rootMessage(ex));
-                    return null;
-                });
-    }
-
     private static String rootMessage(Throwable t) {
         Throwable cur = t;
         while (cur.getCause() != null) cur = cur.getCause();

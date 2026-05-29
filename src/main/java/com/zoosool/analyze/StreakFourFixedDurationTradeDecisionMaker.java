@@ -5,6 +5,7 @@ import com.zoosool.deriv.BalanceHolder;
 import com.zoosool.deriv.DerivTradingService;
 import com.zoosool.model.AnalyzeContainer;
 import com.zoosool.model.Contract;
+import com.zoosool.state.TradeWindowState;
 
 import java.math.BigDecimal;
 import java.nio.file.Path;
@@ -41,8 +42,6 @@ import java.util.function.Consumer;
  */
 public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDecisionMaker {
 
-    private static final String ALLOWED_SYMBOL = "stpRNG3";
-
     // TODO: tune before enabling live trading
 //    private static final BigDecimal[] LADDER = {
 //            BigDecimal.valueOf(2),
@@ -70,8 +69,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private static final int MIN_HISTORY_SECONDS_BEFORE_TRADING = TAPE_KEEP_SECONDS;
 
     private static final String DEFAULT_DURATION_UNIT = "t";
-    private static final String DEFAULT_STAKE_TYPE = "stake";
-    //private static final String DEFAULT_STAKE_TYPE = "payout";
 
     private enum Direction { UP, DOWN, NONE }
 
@@ -121,6 +118,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private boolean stopped = false;
     private String stopReason = null;
     private LocalDateTime stopAt = null;
+    private final TradeWindowState tradeWindowState;
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -129,12 +127,13 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     public StreakFourFixedDurationTradeDecisionMaker(
             DerivTradingService trading,
             BalanceHolder balanceHolder,
-            Consumer<String> logger
-    ) {
+            Consumer<String> logger,
+            TradeWindowState tradeWindowState) {
         this.trading = Objects.requireNonNull(trading, "trading");
         this.balanceHolder = Objects.requireNonNull(balanceHolder, "balanceHolder");
         this.log = Objects.requireNonNull(logger, "logger");
         this.recorder = new TradeHistoryRecorder(Path.of("trade-data"), s -> {});
+        this.tradeWindowState = tradeWindowState;
     }
 
     // -------------------------------------------------------------------------
@@ -144,11 +143,11 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     @Override
     public void decideAndTrade(String symbol, AnalyzeContainer analyze) {
         // TRADING IS DISABLED — remove this block to enable
-//        if (true) {
-//            return;
-//        }
+        if (!tradeWindowState.isAutoTradeEnabled()) {
+            return;
+        }
 
-        if (!ALLOWED_SYMBOL.equals(symbol)) {
+        if (!tradeWindowState.getSelectedAsset().symbol().equals(symbol)) {
             return;
         }
 
@@ -199,7 +198,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                         stake.stakePerSide(),
                         CONTRACT_DURATION_SECONDS,
                         DEFAULT_DURATION_UNIT,
-                        DEFAULT_STAKE_TYPE
+                        tradeWindowState.getBasis()
                 );
 
                 long tradeSeq = nextTradeSeq++;
@@ -332,7 +331,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 plan.tradeSeq(),
                 plan.epochSecond(),
                 plan.durationSeconds(),
-                DEFAULT_STAKE_TYPE,
+                tradeWindowState.getBasis(),
                 plan.stake().stakePerSide().toPlainString(),
                 plan.stake().ladderIdxAtSend(),
                 prevIdx,

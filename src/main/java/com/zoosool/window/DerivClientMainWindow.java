@@ -4,6 +4,7 @@ import com.zoosool.deriv.DerivOperations;
 import com.zoosool.model.ActiveSymbol;
 import com.zoosool.model.Contract;
 import com.zoosool.model.DerivSession;
+import com.zoosool.state.TradeWindowState;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Parent;
@@ -30,17 +31,16 @@ public class DerivClientMainWindow {
     private final ComboBox<Integer> selectorDurationTicks = new ComboBox<>(observableArrayList(2, 4, 6, 8, 10, 15, 17, 19, 35, 43, 57, 61));
     private final ComboBox<String> selectorBasis = new ComboBox<>(observableArrayList("payout", "stake"));
 
-    private final Button buyButton        = new Button("BUY");
-    private final Button sellButton       = new Button("SELL");
-    private final Button buySellButton    = new Button("BUY/SELL");
+    private final Button buyButton          = new Button("BUY");
+    private final Button sellButton         = new Button("SELL");
+    private final Button buySellButton      = new Button("BUY/SELL");
     private final Button buySellSmartButton = new Button("BUY/SELL/s");
-    private final Button buySellDButton   = new Button("BUY/SELL/d");
-    private final Button sellBuyDButton   = new Button("SELL/BUY/d");
 
     private static final String DURATION_UNIT_T = "t";
     private static final String DURATION_UNIT_S = "s";
 
-    public DerivClientMainWindow(DerivOperations operations, DerivSession derivSession, AppLogView logView, TickStatsView statsView) {
+    public DerivClientMainWindow(DerivOperations operations, DerivSession derivSession, AppLogView logView, TickStatsView statsView,
+                                 TradeWindowState state) {
         this.operations = operations;
         this.logView = logView;
 
@@ -155,10 +155,13 @@ public class DerivClientMainWindow {
 
         if (!activeSymbols.isEmpty()) {
             selectorCurrentAsset.getSelectionModel().selectFirst();
+            state.setSelectedAsset(activeSymbols.get(0));
         }
         selectorCurrentAsset.valueProperty().addListener((obs, oldV, newV) -> {
             if (newV == null) {
                 selectorCurrentAsset.setValue(oldV != null ? oldV : (activeSymbols.isEmpty() ? null : activeSymbols.get(0)));
+            } else {
+                state.setSelectedAsset(newV);
             }
         });
 
@@ -184,13 +187,21 @@ public class DerivClientMainWindow {
         selectorDurationTicks.getSelectionModel().selectFirst();
         selectorDurationTicks.setEditable(false);
         selectorDurationTicks.valueProperty().addListener((obs, oldV, newV) -> {
-            if (newV == null) selectorDurationTicks.setValue(oldV != null ? oldV : 2);
+            if (newV == null) {
+                selectorDurationTicks.setValue(oldV != null ? oldV : 2);
+            } else {
+                state.setDuration(newV);
+            }
         });
 
         selectorBasis.getSelectionModel().selectFirst();
         selectorBasis.setEditable(false);
         selectorBasis.valueProperty().addListener((obs, oldV, newV) -> {
-            if (newV == null) selectorBasis.setValue(oldV != null ? oldV : "payout");
+            if (newV == null) {
+                selectorBasis.setValue(oldV != null ? oldV : "payout");
+            } else {
+                state.setBasis(newV);
+            }
         });
 
         form.add(fieldLabel("Current asset"), 0, 0);
@@ -205,14 +216,36 @@ public class DerivClientMainWindow {
         form.add(fieldLabel("Stake"), 0, 3);
         form.add(stakeField, 1, 3);
 
-        // Buttons — два ряда
-        HBox buttons1 = new HBox(10, buySellSmartButton, buySellButton, buyButton, sellButton);
-        buttons1.setAlignment(Pos.CENTER_LEFT);
+        // Auto-trade checkbox
+        CheckBox autoTradeCheckBox = new CheckBox("Enable auto-trade");
+        autoTradeCheckBox.setSelected(false);
+        autoTradeCheckBox.setStyle("""
+                -fx-text-fill: rgba(255,255,255,0.85);
+                -fx-font-size: 12px;
+                """);
+        autoTradeCheckBox.selectedProperty().addListener((obs, oldV, newV) -> {
+            autoTradeCheckBox.setStyle(newV
+                    ? """
+                      -fx-text-fill: rgba(255,255,255,0.85);
+                      -fx-font-size: 12px;
+                      -fx-mark-color: black;
+                      -fx-background-color: white, white, #22c55e;
+                      """
+                    : """
+                      -fx-text-fill: rgba(255,255,255,0.85);
+                      -fx-font-size: 12px;
+                      -fx-mark-color: black;
+                      -fx-background-color: rgba(255,255,255,0.15), rgba(255,255,255,0.15), #1e293b;
+                      """);
+            state.setAutoTradeEnabled(newV);
+            logView.log("Auto-trade: " + (newV ? "ENABLED ✅" : "DISABLED ⛔"));
+        });
 
-        HBox buttons2 = new HBox(10, buySellDButton, sellBuyDButton);
-        buttons2.setAlignment(Pos.CENTER_LEFT);
+        // Buttons
+        HBox buttons = new HBox(10, buySellSmartButton, buySellButton, buyButton, sellButton);
+        buttons.setAlignment(Pos.CENTER_LEFT);
 
-        VBox buttonsBox = new VBox(8, buttons1, buttons2);
+        VBox buttonsBox = new VBox(8, buttons, autoTradeCheckBox);
 
         styleButtons();
 
@@ -262,53 +295,6 @@ public class DerivClientMainWindow {
 
             stakeField.clear();
         });
-
-        buySellDButton.setOnAction(e -> {
-            BigDecimal stake = parseStakeOrLog();
-            if (stake == null) return;
-
-            ActiveSymbol asset = selectorCurrentAsset.getValue();
-            if (asset == null) {
-                logView.log("Current asset is not selected");
-                return;
-            }
-
-            logView.log("BUY SELL D clicked. stake=" + stake + ", asset=" + asset.symbol());
-
-            this.operations.buySellD(new Contract(
-                    asset.symbol(),
-                    stake,
-                    selectorDurationTicks.getValue(),
-                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
-                    selectorBasis.getValue()
-            ));
-
-            stakeField.clear();
-        });
-
-        sellBuyDButton.setOnAction(e -> {
-            BigDecimal stake = parseStakeOrLog();
-            if (stake == null) return;
-
-            ActiveSymbol asset = selectorCurrentAsset.getValue();
-            if (asset == null) {
-                logView.log("Current asset is not selected");
-                return;
-            }
-
-            logView.log("SELL BUY D clicked. stake=" + stake + ", asset=" + asset.symbol());
-
-            this.operations.sellBuyD(new Contract(
-                    asset.symbol(),
-                    stake,
-                    selectorDurationTicks.getValue(),
-                    selectorDurationTicks.getValue() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
-                    selectorBasis.getValue()
-            ));
-
-            stakeField.clear();
-        });
-
 
         buySellButton.setOnAction(e -> {
             BigDecimal stake = parseStakeOrLog();
@@ -408,22 +394,16 @@ public class DerivClientMainWindow {
         stylePrimary(buySellButton,      "#7c3aed");
         stylePrimary(buyButton,          "#22c55e");
         stylePrimary(sellButton,         "#ef4444");
-        stylePrimary(buySellDButton,     "#0ea5e9");
-        stylePrimary(sellBuyDButton,     "#f97316");
 
         buySellSmartButton.setPrefHeight(36);
         buySellButton.setPrefHeight(36);
         buyButton.setPrefHeight(36);
         sellButton.setPrefHeight(36);
-        buySellDButton.setPrefHeight(36);
-        sellBuyDButton.setPrefHeight(36);
 
         buySellSmartButton.setMinWidth(120);
         buySellButton.setMinWidth(120);
         buyButton.setMinWidth(90);
         sellButton.setMinWidth(90);
-        buySellDButton.setMinWidth(120);
-        sellBuyDButton.setMinWidth(120);
     }
 
     private void stylePrimary(Button b, String color) {

@@ -4,6 +4,7 @@ import com.zoosool.analyze.*;
 import com.zoosool.config.DerivAppConfig;
 import com.zoosool.deriv.*;
 import com.zoosool.model.DerivSession;
+import com.zoosool.state.TradeWindowState;
 import com.zoosool.window.AppLogView;
 import com.zoosool.window.DerivClientMainWindow;
 import com.zoosool.window.TickStatsView;
@@ -36,6 +37,7 @@ public class DerivDesktopClientApp extends Application {
     @Override
     public void init() {
         DerivAppConfig cfg = DerivAppConfig.load(Path.of("config.deriv.properties"));
+        TradeWindowState tradeWindowState = new TradeWindowState();
 
         appIoExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "app-io");
@@ -58,7 +60,7 @@ public class DerivDesktopClientApp extends Application {
         DerivTradingService trading = new DerivTradingService(derivConnectorHolder, derivCurrencyHolder, appLogView.logger());
 
         StreakFourFixedDurationTradeDecisionMaker noFilterTradeDecisionMaker =
-                new StreakFourFixedDurationTradeDecisionMaker(trading, balanceHolder, appLogView.logger());
+                new StreakFourFixedDurationTradeDecisionMaker(trading, balanceHolder, appLogView.logger(), tradeWindowState);
 
         TickDecisionEngineSink tickDecisionEngineSink = new TickDecisionEngineSink(statsView, noFilterTradeDecisionMaker);
         TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, tickDecisionEngineSink);
@@ -92,7 +94,7 @@ public class DerivDesktopClientApp extends Application {
         derivConnectorHolder.setConnector(connector);
 
         DerivController derivController = new DerivController(trading, appLogView.logger());
-        derivClientMainWindow = new DerivClientMainWindow(derivController, derivSession, appLogView, statsView);
+        derivClientMainWindow = new DerivClientMainWindow(derivController, derivSession, appLogView, statsView, tradeWindowState);
 
         pingScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "app-ping");
