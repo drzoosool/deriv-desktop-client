@@ -168,7 +168,6 @@ public class DerivClientMainWindow {
             }
         });
 
-        // State → UI: стейт изменился (например клик в TickStatsView) → обновляем комбобокс
         state.selectedAssetProperty().addListener((obs, oldV, newV) -> {
             if (newV == null) return;
             if (!newV.equals(selectorCurrentAsset.getValue())) {
