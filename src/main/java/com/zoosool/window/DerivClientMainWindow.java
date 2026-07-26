@@ -318,11 +318,35 @@ public class DerivClientMainWindow {
 
         applyCheckBoxStyle(redirectCheckBox, redirectCheckBox.isSelected());
 
+        // ── Call Type checkbox ───────────────────────────────────────────
+        CheckBox allowEqualsCheckBox = new CheckBox("Allow equals");
+        allowEqualsCheckBox.setSelected(state.isAllowEquals());
+
+        // UI → State
+        allowEqualsCheckBox.selectedProperty().addListener((obs, oldV, newV) -> {
+            applyCheckBoxStyle(allowEqualsCheckBox, newV);
+            if (newV != state.isAllowEquals()) {
+                state.setAllowEquals(newV);
+            }
+        });
+
+        // State → UI
+        state.allowEqualsProperty().addListener((obs, oldV, newV) -> {
+            if (newV != allowEqualsCheckBox.isSelected()) {
+                Platform.runLater(() -> {
+                    allowEqualsCheckBox.setSelected(newV);
+                    applyCheckBoxStyle(allowEqualsCheckBox, newV);
+                });
+            }
+        });
+
+        applyCheckBoxStyle(allowEqualsCheckBox, allowEqualsCheckBox.isSelected());
+
         // ── Buttons ─────────────────────────────────────────────────────
         HBox buttons = new HBox(10, buySellSmartButton, buySellButton, buyButton, sellButton);
         buttons.setAlignment(Pos.CENTER_LEFT);
 
-        HBox checkBoxes = new HBox(16, autoTradeCheckBox, redirectCheckBox);
+        HBox checkBoxes = new HBox(16, autoTradeCheckBox, redirectCheckBox, allowEqualsCheckBox);
         checkBoxes.setAlignment(Pos.CENTER_LEFT);
 
         VBox buttonsBox = new VBox(8, buttons, checkBoxes);
@@ -403,7 +427,8 @@ public class DerivClientMainWindow {
                 stake,
                 state.getDuration(),
                 state.getDuration() > 10 ? DURATION_UNIT_S : DURATION_UNIT_T,
-                state.getBasis()
+                state.getBasis(),
+                state.isAllowEquals()
         );
     }
 
@@ -425,7 +450,8 @@ public class DerivClientMainWindow {
                 stake,
                 duration,
                 DURATION_UNIT_S,
-                state.getBasis()
+                state.getBasis(),
+                state.isAllowEquals()
         );
     }
 

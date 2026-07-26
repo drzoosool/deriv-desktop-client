@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.zoosool.analyze.TickHandler;
 import com.zoosool.config.DerivAppConfig;
 import com.zoosool.model.ActiveSymbol;
+import com.zoosool.model.DerivConnection;
 import com.zoosool.model.DerivSession;
 
 import java.util.ArrayList;
@@ -111,14 +112,13 @@ public final class DefaultDerivConnector implements DerivConnector {
     }
 
     private void doConnect(CompletableFuture<DerivSession> f) {
-        final DerivWsClient wsLocal;
-
+        final DerivConnection derivConnection;
         try {
             if (state.get() == ConnectionState.CLOSED) {
                 f.completeExceptionally(new IllegalStateException("Connector is CLOSED"));
                 return;
             }
-            wsLocal = DerivWebSocketClientFactory.getClient(cfg, log, tickHandler, balanceHandler);
+            derivConnection = DerivWebSocketClientFactory.getClient(cfg, log, tickHandler, balanceHandler);
         } catch (Throwable ex) {
             connectingFuture = null;
             if (state.get() != ConnectionState.CLOSED) {
@@ -128,21 +128,15 @@ public final class DefaultDerivConnector implements DerivConnector {
             return;
         }
 
+        final DerivWsClient wsLocal = derivConnection.ws();
         try {
             wsLocal.setDisconnectListener((where, ex) -> invalidate(ex, "ws/" + where));
             wsLocal.connect();
 
             DerivSession newSession = wsLocal.authorized()
-                    .thenApply(authResp -> {
-                        String currency = authResp.path("authorize").path("currency").asText(null);
-                        if (currency == null || currency.isBlank()) {
-                            throw new IllegalStateException("Cannot detect account currency from authorize response");
-                        }
-                        return currency;
-                    })
-                    .thenCompose(currency ->
-                            loadActiveSymbols(wsLocal).thenApply(list -> new DerivSession(currency, list))
-                    )
+                    .thenCompose(ignored ->
+                            loadActiveSymbols(wsLocal)
+                                    .thenApply(list -> new DerivSession(derivConnection.currency(), list)))
                     .join();
 
             tickHandler.onReconnect("connect/new-session");
@@ -179,7 +173,6 @@ public final class DefaultDerivConnector implements DerivConnector {
     private CompletableFuture<List<ActiveSymbol>> loadActiveSymbols(DerivWsClient ws) {
         ObjectNode req = mapper.createObjectNode();
         req.put("active_symbols", "brief");
-        req.put("product_type", "basic");
 
         return ws.sendRequest(req).thenApply(resp -> {
             JsonNode list = resp.path("active_symbols");
@@ -187,16 +180,24 @@ public final class DefaultDerivConnector implements DerivConnector {
                 throw new IllegalStateException("active_symbols not array: " + resp);
             }
 
+//            if (list.size() > 0) {
+//                System.out.println("active_symbols[0] raw: " + list.get(0).toPrettyString());
+//            }
+
             List<ActiveSymbol> out = new ArrayList<>();
             for (JsonNode s : list) {
-                String symbol = s.path("symbol").asText(null);
+                String symbol = s.path("underlying_symbol").asText(null);
                 if (symbol == null || symbol.isBlank()) continue;
-                String display = s.path("display_name").asText("");
+
+                String display = s.path("underlying_symbol_name").asText("");
+                if (display.isBlank()) display = symbol;
+
                 out.add(new ActiveSymbol(symbol, display));
             }
 
             if (out.isEmpty()) {
-                throw new IllegalStateException("active_symbols is empty");
+                throw new IllegalStateException(
+                        "active_symbols is empty — проверь имена полей в active_symbols[0] raw выше");
             }
             return out;
         });

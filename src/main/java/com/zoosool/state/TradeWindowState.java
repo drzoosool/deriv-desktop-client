@@ -11,6 +11,7 @@ public class TradeWindowState {
 
     private final BooleanProperty autoTradeEnabled = new SimpleBooleanProperty(false);
     private final BooleanProperty redirectEnabled  = new SimpleBooleanProperty(false);
+    private final BooleanProperty allowEquals = new SimpleBooleanProperty(false);
     private final ObjectProperty<ActiveSymbol> selectedAsset = new SimpleObjectProperty<>(null);
     private final StringProperty basis    = new SimpleStringProperty("payout");
     private final IntegerProperty duration = new SimpleIntegerProperty(2);
@@ -51,4 +52,9 @@ public class TradeWindowState {
     public StringProperty stakeProperty() { return stake; }
     public String getStake() { return stake.get(); }
     public void setStake(String v) { stake.set(v); }
+
+    // call mode
+    public BooleanProperty allowEqualsProperty() { return allowEquals; }
+    public boolean isAllowEquals() { return allowEquals.get(); }
+    public void setAllowEquals(boolean v) { allowEquals.set(v); }
 }

@@ -198,7 +198,8 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                         stake.stakePerSide(),
                         CONTRACT_DURATION_SECONDS,
                         DEFAULT_DURATION_UNIT,
-                        tradeWindowState.getBasis()
+                        tradeWindowState.getBasis(),
+                        false
                 );
 
                 long tradeSeq = nextTradeSeq++;

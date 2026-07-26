@@ -305,14 +305,16 @@ public final class DerivTradingService {
 
             Objects.requireNonNull(contract, "contract");
 
+            String effectiveContractType = contract.allowEquals() ? contractType + "E" : contractType;
+
             ObjectNode params = mapper.createObjectNode();
             params.put("amount", contract.stake());
             params.put("basis", contract.basis());
-            params.put("contract_type", contractType);
+            params.put("contract_type", effectiveContractType);
             params.put("currency", derivCurrencyHolder.getCurrency().get());
             params.put("duration", contract.durationTicks());
             params.put("duration_unit", contract.durationUnit());
-            params.put("symbol", contract.symbol());
+            params.put("underlying_symbol", contract.symbol());
 
             ObjectNode buy = mapper.createObjectNode();
             buy.put("buy", 1);

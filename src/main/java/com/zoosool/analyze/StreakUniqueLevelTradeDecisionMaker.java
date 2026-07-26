@@ -202,7 +202,8 @@ public final class StreakUniqueLevelTradeDecisionMaker implements TradeDecisionM
                             stake.stakePerSide(),
                             durationSeconds,
                             DEFAULT_DURATION_UNIT,
-                            DEFAULT_STAKE_TYPE
+                            DEFAULT_STAKE_TYPE,
+                            false
                     );
 
                     long tradeSeq = nextTradeSeq++;

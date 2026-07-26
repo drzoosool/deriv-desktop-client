@@ -17,6 +17,19 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
+/**
+ * WebSocket-клиент нового Options-контура Deriv.
+ *
+ * Отличие от legacy v3: сессия авторизуется одноразовым OTP, вшитым в URL сокета
+ * (URL берётся из REST-ответа /accounts/{id}/otp). Никакого in-band {"authorize": token}
+ * больше не шлём — соединение уже авторизовано на момент onOpen.
+ *
+ * ВНИМАНИЕ: корреляция ответов по req_id (sendRequest -> pending) предполагает,
+ * что сервер эхает req_id обратно. В новом контуре это ещё не подтверждено.
+ * Если req_id не возвращается — future из sendRequest НИКОГДА не завершится.
+ * Тики при этом идут независимо (они push, мимо futures), так что "тики текут"
+ * не доказывает, что req_id работает. Проверять на первом же запросе-с-ответом.
+ */
 public class DerivWsClient extends WebSocketClient {
 
     private final ObjectMapper mapper = new ObjectMapper();
@@ -25,9 +38,18 @@ public class DerivWsClient extends WebSocketClient {
     private final TickHandler tickHandler;
     private final BalanceHandler balanceHandler;
 
+    /**
+     * Больше не используется для авторизации (OTP в URL). Оставлен, чтобы не менять
+     * сигнатуру конструктора и вызывающий код. Кандидат на удаление при чистке.
+     */
     private final String token;
+
     private final Consumer<String> log;
 
+    /**
+     * Готовность сессии. Раньше завершался ответом на authorize;
+     * теперь — фактом открытия сокета (OTP уже авторизовал соединение).
+     */
     private final CompletableFuture<JsonNode> authorizeResp = new CompletableFuture<>();
 
     /**
@@ -42,13 +64,11 @@ public class DerivWsClient extends WebSocketClient {
                          TickHandler tickHandler,
                          BalanceHandler balanceHandler) {
         super(serverUri);
-        this.balanceHandler = balanceHandler;
-        if (token == null || token.isBlank()) {
-            throw new IllegalArgumentException("Deriv token must not be blank");
-        }
+        // token намеренно не валидируется: авторизация теперь через OTP в URL
         this.token = token;
         this.log = (log != null) ? log : System.out::println;
         this.tickHandler = tickHandler;
+        this.balanceHandler = balanceHandler;
     }
 
     public void setDisconnectListener(BiConsumer<String, Exception> disconnectListener) {
@@ -61,22 +81,11 @@ public class DerivWsClient extends WebSocketClient {
 
     @Override
     public void onOpen(ServerHandshake handshake) {
-        log("🔌 WS connected, authorizing...");
-
-        ObjectNode auth = mapper.createObjectNode();
-        auth.put("authorize", token);
-
-        sendRequest(auth)
-                .thenAccept(resp -> {
-                    log("✅ Authorized: " + compactJson(resp));
-                    authorizeResp.complete(resp);
-                })
-                .exceptionally(ex -> {
-                    log("❌ Authorization failed: " + rootMessage(ex));
-                    authorizeResp.completeExceptionally(ex);
-                    fireDisconnect("authorize", unwrapException(ex));
-                    return null;
-                });
+        // Новый OTP-контур: URL уже несёт otp, сессия авторизована на коннекте.
+        // In-band {"authorize": token} больше не отправляем.
+        log("🔌 WS connected (OTP session, pre-authorized)");
+        authorizeResp.complete(
+                mapper.createObjectNode().put("status", "authorized_via_otp"));
     }
 
     @Override
@@ -105,27 +114,32 @@ public class DerivWsClient extends WebSocketClient {
             }
 
             if ("tick".equals(msgType)) {
-                tickHandler.onTick(node);
+                if (tickHandler != null) {
+                    tickHandler.onTick(node);
+                }
                 return;
             }
 
             if ("balance".equals(msgType)) {
-                balanceHandler.onBalance(node);
+                if (balanceHandler != null) {
+                    balanceHandler.onBalance(node);
+                }
                 return;
             }
 
-//            // 3) Log other push messages to understand the stream
-//            if (!msgType.isBlank()) {
-//                log("📩 PUSH msg_type=" + msgType + " raw=" + compactJson(node));
-//            } else {
-//                log("📩 PUSH without msg_type raw=" + compactJson(node));
-//            }
+            // 3) Log other push messages to understand the stream.
+            //    Полезно держать включённым, пока не подтверждена схема нового контура
+            //    (в т.ч. эхается ли req_id). Заглуши, когда поток станет понятен.
+            if (!msgType.isBlank()) {
+                log("📩 PUSH msg_type=" + msgType + " raw=" + compactJson(node));
+            } else {
+                log("📩 PUSH without msg_type raw=" + compactJson(node));
+            }
 
         } catch (Exception ex) {
             log("❗ parse error: " + ex.getMessage());
         }
     }
-
 
     @Override
     public void onClose(int code, String reason, boolean remote) {
@@ -152,6 +166,9 @@ public class DerivWsClient extends WebSocketClient {
     /**
      * Sends a request with generated req_id and returns a future for its response.
      * If the server responds with "error", the future completes exceptionally.
+     *
+     * NB: завершится только если сервер эхнёт req_id обратно (см. предупреждение
+     * в javadoc класса). Иначе future повиснет — добавь таймаут на стороне вызова.
      */
     public CompletableFuture<JsonNode> sendRequest(ObjectNode req) {
         Objects.requireNonNull(req, "req");
@@ -195,19 +212,5 @@ public class DerivWsClient extends WebSocketClient {
             // Fallback: JsonNode#toString is typically already compact.
             return String.valueOf(node);
         }
-    }
-
-    private static String rootMessage(Throwable t) {
-        Throwable cur = t;
-        while (cur.getCause() != null) cur = cur.getCause();
-        String msg = cur.getMessage();
-        return (msg == null || msg.isBlank()) ? cur.getClass().getSimpleName() : msg;
-    }
-
-    private static Exception unwrapException(Throwable t) {
-        if (t == null) return null;
-        Throwable cur = t;
-        while (cur.getCause() != null) cur = cur.getCause();
-        return (cur instanceof Exception) ? (Exception) cur : new RuntimeException(cur);
     }
 }
