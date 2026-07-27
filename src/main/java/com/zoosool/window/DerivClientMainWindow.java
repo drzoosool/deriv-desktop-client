@@ -232,6 +232,14 @@ public class DerivClientMainWindow {
             }
         });
 
+        stakeField.setTextFormatter(new javafx.scene.control.TextFormatter<>(change -> {
+            String text = change.getText();
+            if (text != null && text.contains(" ")) {
+                change.setText(text.replace(" ", ""));
+            }
+            return change;
+        }));
+
         state.stakeProperty().addListener((obs, oldV, newV) -> {
             if (newV != null && !newV.equals(stakeField.getText())) {
                 Platform.runLater(() -> stakeField.setText(newV));

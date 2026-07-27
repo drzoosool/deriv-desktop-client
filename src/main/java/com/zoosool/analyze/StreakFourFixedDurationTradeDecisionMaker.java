@@ -116,8 +116,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         this.tradingEnabled = tradeWindowState.isAutoTradeEnabled();
         tradeWindowState.autoTradeEnabledProperty().addListener((obs, oldV, newV) -> {
             this.tradingEnabled = newV;
-            log.accept("⏱ METRO | " + tsMs() + " | " + threadName()
-                    + " | FLAG_CHANGED -> " + (newV ? "ENABLED" : "DISABLED"));
         });
     }
 
@@ -217,10 +215,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // -------------------------------------------------------------------------
 
     private void fireMetronomeTick(String symbol) {
-        // фикс момента прихода тика — до любых проверок, чтобы видеть весь поток
-        log.accept("⏱ METRO | " + tsMs() + " | " + threadName()
-                + " | TICK_IN symbol=" + symbol + " flag=" + tradingEnabled);
-
         // символ должен совпадать с выбранным в окне
         var selected = tradeWindowState.getSelectedAsset();
         if (selected == null || !selected.symbol().equals(symbol)) {
@@ -229,20 +223,17 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
         // ранний выход по флагу
         if (!tradingEnabled) {
-            log.accept("⏱ METRO | " + tsMs() + " | SKIP flag_off (early)");
             return;
         }
 
         DerivTradingService.Direction dir = tradeWindowState.getDirection();
         if (dir == null) {
-            log.accept("⏱ METRO | " + tsMs() + " | SKIP dir_null");
             return;
         }
 
         // stake из стейта, парсим на каждом тике; пусто/кривое -> пропуск
         BigDecimal stake = parseStakeQuiet(tradeWindowState.getStake());
         if (stake == null) {
-            log.accept("⏱ METRO | " + tsMs() + " | SKIP stake_invalid raw=" + tradeWindowState.getStake());
             return;
         }
 
@@ -257,13 +248,8 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
         // последняя проверка перед самой отправкой — вдруг выключили, пока считали
         if (!tradingEnabled) {
-            log.accept("⏱ METRO | " + tsMs() + " | SKIP flag_off (pre-send)");
             return;
         }
-
-        // вот здесь ставка реально уходит в сеть
-        log.accept("⏱ METRO | " + tsMs() + " | " + threadName()
-                + " | SEND dir=" + dir + " stake=" + stake);
 
         if (dir == DerivTradingService.Direction.UP) {
             trading.buyRise(contract);
@@ -622,14 +608,5 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         int durationSeconds() {
             return CONTRACT_DURATION_SECONDS;
         }
-    }
-
-    private static String tsMs() {
-        return java.time.LocalTime.now().format(
-                java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS"));
-    }
-
-    private static String threadName() {
-        return Thread.currentThread().getName();
     }
 }
