@@ -14,14 +14,17 @@ import java.util.Objects;
  * Calculates:
  * - ADL (Average Directional Length) for L and S windows
  * - MA crossings for L and S windows (MA length = MA_WINDOW)
+ * - MA side aggregate for L and S windows (sum of sign(price - ma) over window):
+ *     > 0  => price mostly ABOVE ma
+ *     < 0  => price mostly BELOW ma
+ *     == 0 => balanced
  * - zero-delta anomalies (ban if >= ZERO_DELTA_BAN_THRESHOLD in S window)
  *
  * Emission:
  * - pushes TickStatsSnapshot to TickStatsSink every tick (1 tick = 1 sec)
  *
  * NOTE:
- * Decision is intentionally NOT computed here anymore.
- * It is computed downstream (or not used at all).
+ * Decision is intentionally NOT computed here.
  */
 public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
@@ -40,7 +43,6 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
     private int size = 0;
     private int head = 0;
 
-    // Keep original quote text exactly as received (for UI / unique counting later)
     private String lastQuoteText = null;
 
     public DefaultTickStatsCalculator(String symbol, TickStatsSink sink) {
@@ -54,7 +56,7 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
         if (event.action() == TickAction.RESET) {
             reset();
-            // Emit warmup snapshot immediately after reset
+            // Warmup snapshot immediately after reset — MA side unknown yet => null, null
             sink.onSnapshot(new TickStatsSnapshot(
                     symbol,
                     TickStatsState.WARMUP_S,
@@ -64,16 +66,16 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                     null, null,
                     null, null,
                     null,            // lastQuote (Double)
-                    null,            // lastQuoteText (String)  <-- NEW
+                    null,            // lastQuoteText (String)
                     0,
                     "RESET",
-                    Instant.now()
+                    Instant.now(),
+                    null
             ));
             return;
         }
 
         if (event.action() == TickAction.STOP) {
-            // worker will stop after STOP; no periodic emit required here
             return;
         }
 
@@ -88,10 +90,8 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
         double q;
         try {
-            // Deriv uses dot as decimal separator; parse as-is.
             q = Double.parseDouble(qText.trim());
         } catch (NumberFormatException ex) {
-            // Ignore malformed values
             return;
         }
 
@@ -99,12 +99,10 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
             return;
         }
 
-        // Store original text for snapshot (and future "unique values" logic)
         lastQuoteText = qText;
 
         appendQuote(q);
 
-        // Emit EVERY tick (1 tick = 1 sec)
         sink.onSnapshot(buildSnapshot());
     }
 
@@ -141,6 +139,8 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         Integer xmaShort = (hasMA && hasShort) ? computeMaCrossings(bufShort) : null;
         Integer xmaLong = (hasMA && hasLong) ? computeMaCrossings(bufLong) : null;
 
+        Integer maSide = (size >= MA_WINDOW) ? computeMaSide() : null;
+
         int zeroShort = hasShort ? computeZeroDeltas(bufShort) : 0;
 
         boolean banned = hasShort && zeroShort >= ZERO_DELTA_BAN_THRESHOLD;
@@ -154,7 +154,7 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         String reason = banned ? "ZERO_DELTA>=" + ZERO_DELTA_BAN_THRESHOLD : null;
 
         Double lastQuote = (size > 0) ? lastQuote() : null;
-        String lastQuoteString= (size > 0) ? lastQuoteText : null;
+        String lastQuoteString = (size > 0) ? lastQuoteText : null;
 
         return new TickStatsSnapshot(
                 symbol,
@@ -173,7 +173,8 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                 lastQuoteString,
                 zeroShort,
                 reason,
-                Instant.now()
+                Instant.now(),
+                maSide
         );
     }
 
@@ -183,10 +184,6 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         return quotes[idx];
     }
 
-    /**
-     * ADL: average length of consecutive same-sign deltas within last windowSize quotes.
-     * - ignores delta==0 for run segmentation
-     */
     private double computeAdl(int windowSize) {
         if (windowSize < 2) return Double.NaN;
 
@@ -235,10 +232,6 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         return runsCount == 0 ? 0.0 : (double) sumRunLengths / (double) runsCount;
     }
 
-    /**
-     * Crossings count between price and MA over last windowSize quotes.
-     * "Touch" (price==MA) does not flip side and does not count as crossing.
-     */
     private int computeMaCrossings(int windowSize) {
         if (windowSize < Math.max(MA_WINDOW, 2)) return 0;
 
@@ -264,6 +257,18 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
             prevSide = side;
         }
         return crossings;
+    }
+
+    private int computeMaSide() {
+        if (size < MA_WINDOW) return 0; // MA16 ещё не набралась
+
+        int last = head - 1;
+        if (last < 0) last += LONG_WINDOW;
+
+        double ma = computeMaAt(last);   // среднее за последние 16 тиков
+        double price = quotes[last];     // цена текущего тика
+
+        return Double.compare(price - ma, 0.0); // +1 / 0 / -1
     }
 
     private int computeZeroDeltas(int windowSize) {

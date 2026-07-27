@@ -369,4 +369,117 @@ public final class DerivTradingService {
     private record BuyAck(long contractId, Long transactionId) { }
 
     private record PocState(boolean sold, boolean expired, String status, double profit, JsonNode payload) { }
+
+    public enum Direction { UP, DOWN }
+
+    /**
+     * Покупает ОДНУ ногу по направлению и ждёт расчёта.
+     * UP -> buyRise (CALL/CALLE), DOWN -> buyFall (PUT/PUTE).
+     * Success = profit этой единственной ноги > 0 (честный результат, без OR по двум ногам).
+     */
+    public CompletableFuture<BuySellResult> buyOneAndAwait(Contract contract, Direction dir) {
+        Objects.requireNonNull(contract, "contract");
+        Objects.requireNonNull(dir, "dir");
+
+        CompletableFuture<Long> buyF =
+                (dir == Direction.UP) ? buyRise(contract) : buyFall(contract);
+
+        String tag = (dir == Direction.UP) ? "CALL" : "PUT";
+
+        return buyF.thenCompose(contractId ->
+                awaitOneSoldRetryForever(contract.symbol(), contractId, tag));
+    }
+
+    private CompletableFuture<BuySellResult> awaitOneSoldRetryForever(String symbol, long contractId, String tag) {
+        CompletableFuture<BuySellResult> out = new CompletableFuture<>();
+        awaitOneAttempt(symbol, contractId, tag, out);
+        return out;
+    }
+
+    private void awaitOneAttempt(String symbol, long contractId, String tag, CompletableFuture<BuySellResult> out) {
+        if (out.isDone()) return;
+
+        awaitOneSold(symbol, contractId, tag).whenComplete((res, ex) -> {
+            if (ex == null) {
+                out.complete(res);
+                return;
+            }
+            Throwable t = unwrapCompletionException(ex);
+            if (t instanceof TimeoutException) {
+                log.accept("🟧 AWAIT TIMEOUT(one) symbol=" + symbol
+                        + " contractId=" + contractId + " tag=" + tag
+                        + " => retry polling in " + AWAIT_RETRY_DELAY_MILLIS + "ms");
+                delay(AWAIT_RETRY_DELAY_MILLIS).whenComplete((v, delayEx) -> {
+                    if (delayEx != null) {
+                        out.completeExceptionally(unwrapCompletionException(delayEx));
+                        return;
+                    }
+                    awaitOneAttempt(symbol, contractId, tag, out);
+                });
+                return;
+            }
+            out.completeExceptionally(t);
+        });
+    }
+
+    private CompletableFuture<BuySellResult> awaitOneSold(String symbol, long contractId, String tag) {
+        CompletableFuture<BuySellResult> out = new CompletableFuture<>();
+
+        AtomicReference<PocState> state = new AtomicReference<>();
+        AtomicBoolean inFlight = new AtomicBoolean(false);
+        AtomicInteger errCount = new AtomicInteger(0);
+        AtomicReference<String> lastErr = new AtomicReference<>(null);
+
+        long startMs = System.currentTimeMillis();
+        AtomicReference<ScheduledFuture<?>> futureRef = new AtomicReference<>();
+
+        Runnable tick = () -> {
+            if (out.isDone()) return;
+
+            if (System.currentTimeMillis() - startMs > AWAIT_TIMEOUT_MILLIS) {
+                out.completeExceptionally(new TimeoutException(
+                        "buyOneAndAwait timeout. symbol=" + symbol + " id=" + contractId
+                                + " errs=" + errCount.get()));
+                return;
+            }
+
+            PocState s = state.get();
+            if ((s == null || !s.sold()) && inFlight.compareAndSet(false, true)) {
+                pollOneContract(symbol, contractId, tag).whenComplete((st, ex) -> {
+                    try {
+                        if (ex != null) {
+                            int n = errCount.incrementAndGet();
+                            String msg = formatErr(ex);
+                            lastErr.set(msg);
+                            log.accept("🟥 POC ERROR " + tag + " symbol=" + symbol
+                                    + " contractId=" + contractId + " count=" + n + " err=" + msg);
+                        } else {
+                            state.set(st);
+                            if (st.sold() && !out.isDone()) {
+                                boolean success = st.profit() > 0.0;
+                                log.accept("🟩 DONE(one) symbol=" + symbol
+                                        + " id=" + contractId + " tag=" + tag
+                                        + " status=" + st.status() + " profit=" + st.profit()
+                                        + " expired=" + (st.expired() ? 1 : 0)
+                                        + " pollErrs=" + errCount.get()
+                                        + (lastErr.get() != null ? (" lastErr=" + lastErr.get()) : "")
+                                        + " => " + (success ? "SUCCESS" : "FAIL"));
+                                out.complete(success ? BuySellResult.SUCCESS : BuySellResult.FAIL);
+                            }
+                        }
+                    } finally {
+                        inFlight.set(false);
+                    }
+                });
+            }
+        };
+
+        ScheduledFuture<?> f = poller.scheduleAtFixedRate(tick, 0, AWAIT_POLL_PERIOD_MILLIS, TimeUnit.MILLISECONDS);
+        futureRef.set(f);
+        out.whenComplete((r, ex) -> {
+            ScheduledFuture<?> ff = futureRef.get();
+            if (ff != null) ff.cancel(false);
+        });
+        return out;
+    }
 }

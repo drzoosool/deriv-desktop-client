@@ -80,7 +80,8 @@ public final class TickDecisionEngineSink implements TickStatsSink, Resetable {
         }
 
         if (st != null) {
-            tradeDecisionMaker.decideAndTrade(symbol, st);
+            //tradeDecisionMaker.decideAndTrade(symbol, st);
+            tradeDecisionMaker.decideAndTradeSnap(symbol, snapshot);
         }
 
         downstream.onSnapshot(snapshot);

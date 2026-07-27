@@ -5,6 +5,7 @@ import com.zoosool.deriv.BalanceHolder;
 import com.zoosool.deriv.DerivTradingService;
 import com.zoosool.model.AnalyzeContainer;
 import com.zoosool.model.Contract;
+import com.zoosool.model.TickStatsSnapshot;
 import com.zoosool.state.TradeWindowState;
 
 import java.math.BigDecimal;
@@ -55,15 +56,19 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
     private static final BigDecimal[] LADDER = {
             BigDecimal.valueOf(1),
-            BigDecimal.valueOf(4),
-            BigDecimal.valueOf(14),
-            BigDecimal.valueOf(50),
-            BigDecimal.valueOf(172),
-            BigDecimal.valueOf(600)
+            BigDecimal.valueOf(2),
+            BigDecimal.valueOf(5),
+            BigDecimal.valueOf(15),
+            BigDecimal.valueOf(40),
+            BigDecimal.valueOf(100),
+            BigDecimal.valueOf(300),
+            BigDecimal.valueOf(800),
+            BigDecimal.valueOf(1600),
+            BigDecimal.valueOf(3500),
     };
 
     private static final int DIR_STREAK_REQUIRED = 4;
-    private static final int CONTRACT_DURATION_SECONDS = 6;
+    private static final int CONTRACT_DURATION_SECONDS = 5;
 
     private static final int TAPE_KEEP_SECONDS = 600;
     private static final int MIN_HISTORY_SECONDS_BEFORE_TRADING = TAPE_KEEP_SECONDS;
@@ -141,7 +146,87 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // -------------------------------------------------------------------------
 
     @Override
+    public void decideAndTradeSnap(String symbol, TickStatsSnapshot snapshot) {
+        if (!tradeWindowState.isAutoTradeEnabled()) {
+            return;
+        }
+        if (snapshot == null) {
+            return;
+        }
+
+        // --- сигнал из снапшота ---
+        Integer xmaShort = snapshot.xmaShort();
+        Integer maSide   = snapshot.maSide();   // +1 above MA16 / -1 below / 0 equal; null=warmup
+
+        // null => нет данных => пропуск. Вход только при 0 пересечений и явной стороне.
+        if (xmaShort == null || maSide == null) return;
+        if (xmaShort != 0) return;
+        if (maSide == 0) return;
+
+        DerivTradingService.Direction dir =
+                (maSide > 0) ? DerivTradingService.Direction.DOWN
+                        : DerivTradingService.Direction.UP;
+
+        LocalDateTime ldt = LocalDateTime.now(zone);
+        long nowEpochSecond = Instant.now().getEpochSecond();
+
+        TradePlan plan = null;
+
+        synchronized (this) {
+            // сквозной guard и лестница — те же поля, что у streak-версии
+            if (stopped || inFlight != null) {
+                return;
+            }
+
+            StakeSnapshot stake = snapshotStakeLocked();
+
+            Contract contract = new Contract(
+                    symbol,
+                    stake.stakePerSide(),
+                    CONTRACT_DURATION_SECONDS,
+                    DEFAULT_DURATION_UNIT,
+                    tradeWindowState.getBasis(),
+                    false
+            );
+
+            long tradeSeq = nextTradeSeq++;
+
+            inFlight = new InFlightTrade(tradeSeq, nowEpochSecond, symbol, stake.stakePerSide(), null);
+
+            // direction тут — направление сигнала, не UP/DOWN из streak enum;
+            // кладу в план как есть для лога
+            plan = new TradePlan(
+                    tradeSeq,
+                    nowEpochSecond,
+                    ldt,
+                    symbol,
+                    snapshot.lastQuote() == null ? 0L : Math.round(snapshot.lastQuote()),
+                    contract,
+                    stake,
+                    (dir == DerivTradingService.Direction.UP) ? Direction.UP : Direction.DOWN
+            );
+        }
+
+        log.accept("🟪 SNAP_TRADE"
+                + " time=" + plan.ldt()
+                + " tradeSeq=" + plan.tradeSeq()
+                + " symbol=" + plan.symbol()
+                + " maSide=" + maSide
+                + " xmaShort=" + xmaShort
+                + " dir=" + dir
+                + " stakePerSide=" + plan.stake().stakePerSide()
+                + " ladderIdx=" + plan.stake().ladderIdxAtSend()
+                + " durationSec=" + CONTRACT_DURATION_SECONDS);
+
+        CompletableFuture<DerivTradingService.BuySellResult> fut = trading.buyOneAndAwait(plan.contract(), dir);
+        wireInFlightFuture(plan, fut);   // переиспользуем — лестница/settle общие
+    }
+
+    @Override
     public void decideAndTrade(String symbol, AnalyzeContainer analyze) {
+        if (true) {
+            return;
+        }
         // TRADING IS DISABLED — remove this block to enable
         if (!tradeWindowState.isAutoTradeEnabled()) {
             return;

@@ -31,7 +31,9 @@ public record TickStatsSnapshot(
         int zeroShort,    // zS
 
         String reason,    // optional: ban/reset reason
-        Instant at        // snapshot time
+        Instant at,        // snapshot time
+
+        Integer maSide
 ) {
     public TickStatsSnapshot {
         Objects.requireNonNull(symbol, "symbol");
