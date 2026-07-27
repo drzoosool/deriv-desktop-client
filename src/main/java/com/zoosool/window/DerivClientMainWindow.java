@@ -18,6 +18,8 @@ import javafx.scene.effect.DropShadow;
 import javafx.scene.input.KeyEvent;
 import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
+import javafx.stage.Stage;
+import javafx.stage.Window;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -31,7 +33,7 @@ public class DerivClientMainWindow {
     private final TradeWindowState state;
     private final SafariBridge safariBridge;
 
-    // корневой контейнер: слева график, справа колонка контента
+    // корневой контейнер: слева сворачиваемый график, справа колонка контента
     private final HBox visualArea = new HBox(12);
 
     private final TextField stakeField = new TextField();
@@ -47,6 +49,13 @@ public class DerivClientMainWindow {
 
     // направление для метронома
     private final Button directionButton = new Button("UP");
+
+    // ── сворачиваемый график ──────────────────────────────────────────
+    private final StackPane chartHolder = new StackPane();
+    private final Button chartToggleButton = new Button("📈 Chart");
+    private boolean chartVisible = false;
+    private static final double CHART_WIDTH = 1000; // ~2× правой колонки (500)
+    private static final double GAP = 12;
 
     private static final String DURATION_UNIT_T = "t";
     private static final String DURATION_UNIT_S = "s";
@@ -92,6 +101,9 @@ public class DerivClientMainWindow {
                 -fx-background-radius: 999;
                 """);
 
+        styleChartToggle(chartToggleButton);
+        chartToggleButton.setOnAction(e -> toggleChart());
+
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
 
@@ -106,7 +118,7 @@ public class DerivClientMainWindow {
                 -fx-border-radius: 999;
                 """);
 
-        header.getChildren().addAll(title, badge, spacer, status);
+        header.getChildren().addAll(title, badge, chartToggleButton, spacer, status);
 
         // Card
         VBox card = new VBox(12);
@@ -475,18 +487,34 @@ public class DerivClientMainWindow {
 
         card.getChildren().addAll(cardTitle, form, buttonsBox);
 
-        // ── компоновка: слева график (растягивается), справа колонка ──────
+        // ── правая колонка (как было) ─────────────────────────────────────
         VBox rightColumn = new VBox(10);
         rightColumn.getChildren().addAll(header, statsView.getNode(), card, logPane);
         rightColumn.setFillWidth(true);
         rightColumn.setPrefWidth(500);
         rightColumn.setMinWidth(460);
 
+        // ── левый сворачиваемый холдер с графиком ─────────────────────────
         Node chartNode = chartView.getNode();
-        HBox.setHgrow(chartNode, Priority.ALWAYS);
+        chartHolder.getChildren().add(chartNode);
+        chartHolder.setStyle("""
+                -fx-background-color: rgba(255,255,255,0.04);
+                -fx-background-radius: 16;
+                """);
+        // старт — свёрнут: 0 ширины, не участвует в раскладке
+        chartHolder.setMinWidth(0);
+        chartHolder.setPrefWidth(0);
+        chartHolder.setMaxWidth(0);
+        chartHolder.setManaged(false);
+        chartHolder.setVisible(false);
+
+        HBox.setHgrow(chartHolder, Priority.NEVER);
         HBox.setHgrow(rightColumn, Priority.NEVER);
 
-        visualArea.getChildren().addAll(chartNode, rightColumn);
+        Region hSpacer = new Region();
+        HBox.setHgrow(hSpacer, Priority.ALWAYS);
+
+        visualArea.getChildren().addAll(chartHolder, hSpacer, rightColumn);
 
         // ── focus traversal off ──────────────────────────────────────────
         buyButton.setFocusTraversable(false);
@@ -509,6 +537,58 @@ public class DerivClientMainWindow {
 
     public Parent getVisualArea() {
         return visualArea;
+    }
+
+    // ── Сворачивание/разворачивание графика ──────────────────────────────
+    private void toggleChart() {
+        chartVisible = !chartVisible;
+
+        Window w = visualArea.getScene() != null ? visualArea.getScene().getWindow() : null;
+        Stage stage = (w instanceof Stage s) ? s : null;
+
+        double delta = CHART_WIDTH + GAP;
+
+        if (chartVisible) {
+            chartHolder.setManaged(true);
+            chartHolder.setVisible(true);
+            chartHolder.setMinWidth(CHART_WIDTH);
+            chartHolder.setPrefWidth(CHART_WIDTH);
+            chartHolder.setMaxWidth(CHART_WIDTH);
+            chartToggleButton.setText("📈 Chart ◀");
+
+            // растём влево: двигаем левую границу окна, правая на месте
+            if (stage != null) {
+                double newX = stage.getX() - delta;
+                if (newX < 0) newX = 0;          // не уезжаем за левый край экрана
+                stage.setX(newX);
+                stage.setWidth(stage.getWidth() + delta);
+            }
+        } else {
+            chartHolder.setMinWidth(0);
+            chartHolder.setPrefWidth(0);
+            chartHolder.setMaxWidth(0);
+            chartHolder.setManaged(false);
+            chartHolder.setVisible(false);
+            chartToggleButton.setText("📈 Chart");
+
+            if (stage != null) {
+                stage.setWidth(Math.max(520, stage.getWidth() - delta));
+                stage.setX(stage.getX() + delta);
+            }
+        }
+    }
+
+    private void styleChartToggle(Button b) {
+        b.setFocusTraversable(false);
+        b.setStyle("""
+                -fx-background-color: rgba(255,255,255,0.10);
+                -fx-text-fill: white;
+                -fx-font-size: 12px;
+                -fx-font-weight: 700;
+                -fx-background-radius: 999;
+                -fx-padding: 4 12 4 12;
+                -fx-cursor: hand;
+                """);
     }
 
     /**
