@@ -11,6 +11,7 @@ import com.zoosool.state.TradeWindowState;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
+import javafx.scene.Node;
 import javafx.scene.Parent;
 import javafx.scene.control.*;
 import javafx.scene.effect.DropShadow;
@@ -30,7 +31,8 @@ public class DerivClientMainWindow {
     private final TradeWindowState state;
     private final SafariBridge safariBridge;
 
-    private final VBox visualArea = new VBox(10);
+    // корневой контейнер: слева график, справа колонка контента
+    private final HBox visualArea = new HBox(12);
 
     private final TextField stakeField = new TextField();
 
@@ -49,7 +51,8 @@ public class DerivClientMainWindow {
     private static final String DURATION_UNIT_T = "t";
     private static final String DURATION_UNIT_S = "s";
 
-    public DerivClientMainWindow(DerivOperations operations, DerivSession derivSession, AppLogView logView, TickStatsView statsView,
+    public DerivClientMainWindow(DerivOperations operations, DerivSession derivSession, AppLogView logView,
+                                 TickStatsView statsView, TickChartView chartView,
                                  TradeWindowState state, SafariBridge safariBridge) {
         this.operations   = operations;
         this.logView      = logView;
@@ -57,6 +60,7 @@ public class DerivClientMainWindow {
         this.safariBridge = safariBridge;
 
         visualArea.setPadding(new Insets(14));
+        visualArea.setFillHeight(true);
         visualArea.setStyle("""
                 -fx-background-color: #0f172a;
                 """);
@@ -470,8 +474,21 @@ public class DerivClientMainWindow {
                 """);
 
         card.getChildren().addAll(cardTitle, form, buttonsBox);
-        visualArea.getChildren().addAll(header, statsView.getNode(), card, logPane);
 
+        // ── компоновка: слева график (растягивается), справа колонка ──────
+        VBox rightColumn = new VBox(10);
+        rightColumn.getChildren().addAll(header, statsView.getNode(), card, logPane);
+        rightColumn.setFillWidth(true);
+        rightColumn.setPrefWidth(500);
+        rightColumn.setMinWidth(460);
+
+        Node chartNode = chartView.getNode();
+        HBox.setHgrow(chartNode, Priority.ALWAYS);
+        HBox.setHgrow(rightColumn, Priority.NEVER);
+
+        visualArea.getChildren().addAll(chartNode, rightColumn);
+
+        // ── focus traversal off ──────────────────────────────────────────
         buyButton.setFocusTraversable(false);
         sellButton.setFocusTraversable(false);
         buySellButton.setFocusTraversable(false);
@@ -498,7 +515,6 @@ public class DerivClientMainWindow {
      * Горячие клавиши, вешается фильтром на Scene:
      *   UP / DOWN  — направление ставки (метроном)
      *   SPACE      — тумблер авто-трейда
-     * Не перехватывает, когда фокус в поле ввода или комбобоксе.
      */
     public void handleHotkey(KeyEvent e) {
         switch (e.getCode()) {

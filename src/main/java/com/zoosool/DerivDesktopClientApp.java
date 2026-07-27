@@ -8,6 +8,7 @@ import com.zoosool.safari.SafariBridge;
 import com.zoosool.state.TradeWindowState;
 import com.zoosool.window.AppLogView;
 import com.zoosool.window.DerivClientMainWindow;
+import com.zoosool.window.TickChartView;
 import com.zoosool.window.TickStatsView;
 import javafx.application.Application;
 import javafx.application.Platform;
@@ -64,7 +65,12 @@ public class DerivDesktopClientApp extends Application {
                 new StreakFourFixedDurationTradeDecisionMaker(trading, balanceHolder, appLogView.logger(), tradeWindowState);
 
         TickStatsView statsView = new TickStatsView(Platform::runLater, tradeWindowState);
-        TickDecisionEngineSink tickDecisionEngineSink = new TickDecisionEngineSink(statsView, noFilterTradeDecisionMaker);
+        TickChartView chartView = new TickChartView(tradeWindowState);
+
+        // раздаём снапшот и в статистику, и в график
+        FanOutTickStatsSink uiSink = new FanOutTickStatsSink(statsView, chartView);
+
+        TickDecisionEngineSink tickDecisionEngineSink = new TickDecisionEngineSink(uiSink, noFilterTradeDecisionMaker);
         TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, tickDecisionEngineSink);
 
         tickEventRouterService = new TickEventRouterService(
@@ -99,7 +105,7 @@ public class DerivDesktopClientApp extends Application {
 
         DerivController derivController = new DerivController(trading, appLogView.logger());
         derivClientMainWindow = new DerivClientMainWindow(
-                derivController, derivSession, appLogView, statsView, tradeWindowState, safariBridge);
+                derivController, derivSession, appLogView, statsView, chartView, tradeWindowState, safariBridge);
 
         pingScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "app-ping");
@@ -111,10 +117,10 @@ public class DerivDesktopClientApp extends Application {
     @Override
     public void start(Stage stage) {
         stage.setTitle("Deriv Desktop Client (MVP)");
-        Scene scene = new Scene(derivClientMainWindow.getVisualArea(), 520, 800);
+        Scene scene = new Scene(derivClientMainWindow.getVisualArea(), 980, 800);
         scene.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED, derivClientMainWindow::handleHotkey);
         stage.setScene(scene);
-        stage.setResizable(false);
+        stage.setResizable(true);
         stage.setAlwaysOnTop(true);
         stage.show();
 
@@ -136,7 +142,6 @@ public class DerivDesktopClientApp extends Application {
         }
 
         if (tickEventRouterService != null) {
-            // This also shuts down tickStatsExecutor (router owns the executor lifecycle here).
             tickEventRouterService.stopAllAndShutdown(TickEventRouterService.DurationLike.seconds(3));
             tickEventRouterService = null;
             tickStatsExecutor = null;
