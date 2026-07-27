@@ -111,7 +111,9 @@ public class DerivDesktopClientApp extends Application {
     @Override
     public void start(Stage stage) {
         stage.setTitle("Deriv Desktop Client (MVP)");
-        stage.setScene(new Scene(derivClientMainWindow.getVisualArea(), 520, 800));
+        Scene scene = new Scene(derivClientMainWindow.getVisualArea(), 520, 800);
+        scene.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED, derivClientMainWindow::handleHotkey);
+        stage.setScene(scene);
         stage.setResizable(false);
         stage.setAlwaysOnTop(true);
         stage.show();

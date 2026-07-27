@@ -3,6 +3,7 @@ package com.zoosool.analyze;
 
 import com.zoosool.deriv.BalanceHolder;
 import com.zoosool.deriv.DerivTradingService;
+import com.zoosool.enums.TradeMode;
 import com.zoosool.model.AnalyzeContainer;
 import com.zoosool.model.Contract;
 import com.zoosool.model.TickStatsSnapshot;
@@ -19,40 +20,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 
-/**
- * Rule-based auto-trader for stpRNG.
- *
- * Signal:
- * - 4 consecutive ticks in the same direction (UP or DOWN) → trade.
- * - Contract duration: fixed 4 seconds.
- *
- * Ladder:
- * - Configured via LADDER constant; reset on SUCCESS, advance on FAIL.
- * - Stop trading when FAIL on last ladder step.
- *
- * In-flight guard:
- * - While a trade is active (inFlight != null) no new trade is opened.
- * - As soon as result arrives → ready for next signal immediately.
- *
- * No cooldown. No active window. No per-minute limit.
- *
- * Dataset logging:
- * - Tape: sliding 600-second window (1 Hz).
- * - Warmup: 600 seconds before first trade.
- * - On trade CLOSE: one JSONL record with last 600 sec ending at result time.
- */
 public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDecisionMaker {
-
-    // TODO: tune before enabling live trading
-//    private static final BigDecimal[] LADDER = {
-//            BigDecimal.valueOf(2),
-//            BigDecimal.valueOf(5),
-//            BigDecimal.valueOf(15),
-//            BigDecimal.valueOf(45),
-//            BigDecimal.valueOf(135),
-//            BigDecimal.valueOf(405),
-//            BigDecimal.valueOf(1300),
-//    };
 
     private static final BigDecimal[] LADDER = {
             BigDecimal.valueOf(1),
@@ -76,6 +44,8 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private static final String DEFAULT_DURATION_UNIT = "t";
 
     private enum Direction { UP, DOWN, NONE }
+
+    private volatile boolean tradingEnabled = false;
 
     // -------------------------------------------------------------------------
     // Dependencies
@@ -125,6 +95,9 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private LocalDateTime stopAt = null;
     private final TradeWindowState tradeWindowState;
 
+    // metronome: не даём слать больше одной ставки в секунду
+    private long lastMetronomeEpochSecond = -1;
+
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
@@ -139,26 +112,45 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         this.log = Objects.requireNonNull(logger, "logger");
         this.recorder = new TradeHistoryRecorder(Path.of("trade-data"), s -> {});
         this.tradeWindowState = tradeWindowState;
+
+        this.tradingEnabled = tradeWindowState.isAutoTradeEnabled();
+        tradeWindowState.autoTradeEnabledProperty().addListener((obs, oldV, newV) -> {
+            this.tradingEnabled = newV;
+            log.accept("⏱ METRO | " + tsMs() + " | " + threadName()
+                    + " | FLAG_CHANGED -> " + (newV ? "ENABLED" : "DISABLED"));
+        });
     }
 
     // -------------------------------------------------------------------------
-    // Main entry point
+    // Main entry point — роутинг по режиму
     // -------------------------------------------------------------------------
 
     @Override
     public void decideAndTradeSnap(String symbol, TickStatsSnapshot snapshot) {
-        if (!tradeWindowState.isAutoTradeEnabled()) {
+        if (!tradingEnabled) {          // было: !tradeWindowState.isAutoTradeEnabled()
             return;
         }
         if (snapshot == null) {
             return;
         }
 
-        // --- сигнал из снапшота ---
+        TradeMode mode = tradeWindowState.getTradeMode();
+        if (mode == null) return;
+
+        switch (mode) {
+            case SNAP -> handleSnap(symbol, snapshot);
+            case METRONOME -> fireMetronomeTick(symbol);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SNAP strategy (бывшая логика decideAndTradeSnap)
+    // -------------------------------------------------------------------------
+
+    private void handleSnap(String symbol, TickStatsSnapshot snapshot) {
         Integer xmaShort = snapshot.xmaShort();
         Integer maSide   = snapshot.maSide();   // +1 above MA16 / -1 below / 0 equal; null=warmup
 
-        // null => нет данных => пропуск. Вход только при 0 пересечений и явной стороне.
         if (xmaShort == null || maSide == null) return;
         if (xmaShort != 0) return;
         if (maSide == 0) return;
@@ -170,10 +162,9 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         LocalDateTime ldt = LocalDateTime.now(zone);
         long nowEpochSecond = Instant.now().getEpochSecond();
 
-        TradePlan plan = null;
+        TradePlan plan;
 
         synchronized (this) {
-            // сквозной guard и лестница — те же поля, что у streak-версии
             if (stopped || inFlight != null) {
                 return;
             }
@@ -193,8 +184,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
             inFlight = new InFlightTrade(tradeSeq, nowEpochSecond, symbol, stake.stakePerSide(), null);
 
-            // direction тут — направление сигнала, не UP/DOWN из streak enum;
-            // кладу в план как есть для лога
             plan = new TradePlan(
                     tradeSeq,
                     nowEpochSecond,
@@ -219,15 +208,89 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 + " durationSec=" + CONTRACT_DURATION_SECONDS);
 
         CompletableFuture<DerivTradingService.BuySellResult> fut = trading.buyOneAndAwait(plan.contract(), dir);
-        wireInFlightFuture(plan, fut);   // переиспользуем — лестница/settle общие
+        wireInFlightFuture(plan, fut);
     }
+
+    // -------------------------------------------------------------------------
+    // METRONOME strategy — одна ставка на каждый тик выбранного символа,
+    // fire-and-forget: результат не ждём, in-flight/лестницу не трогаем.
+    // -------------------------------------------------------------------------
+
+    private void fireMetronomeTick(String symbol) {
+        // фикс момента прихода тика — до любых проверок, чтобы видеть весь поток
+        log.accept("⏱ METRO | " + tsMs() + " | " + threadName()
+                + " | TICK_IN symbol=" + symbol + " flag=" + tradingEnabled);
+
+        // символ должен совпадать с выбранным в окне
+        var selected = tradeWindowState.getSelectedAsset();
+        if (selected == null || !selected.symbol().equals(symbol)) {
+            return;
+        }
+
+        // ранний выход по флагу
+        if (!tradingEnabled) {
+            log.accept("⏱ METRO | " + tsMs() + " | SKIP flag_off (early)");
+            return;
+        }
+
+        DerivTradingService.Direction dir = tradeWindowState.getDirection();
+        if (dir == null) {
+            log.accept("⏱ METRO | " + tsMs() + " | SKIP dir_null");
+            return;
+        }
+
+        // stake из стейта, парсим на каждом тике; пусто/кривое -> пропуск
+        BigDecimal stake = parseStakeQuiet(tradeWindowState.getStake());
+        if (stake == null) {
+            log.accept("⏱ METRO | " + tsMs() + " | SKIP stake_invalid raw=" + tradeWindowState.getStake());
+            return;
+        }
+
+        Contract contract = new Contract(
+                symbol,
+                stake,
+                1,                              // duration: 1 тик
+                DEFAULT_DURATION_UNIT,          // "t"
+                tradeWindowState.getBasis(),
+                tradeWindowState.isAllowEquals()
+        );
+
+        // последняя проверка перед самой отправкой — вдруг выключили, пока считали
+        if (!tradingEnabled) {
+            log.accept("⏱ METRO | " + tsMs() + " | SKIP flag_off (pre-send)");
+            return;
+        }
+
+        // вот здесь ставка реально уходит в сеть
+        log.accept("⏱ METRO | " + tsMs() + " | " + threadName()
+                + " | SEND dir=" + dir + " stake=" + stake);
+
+        if (dir == DerivTradingService.Direction.UP) {
+            trading.buyRise(contract);
+        } else {
+            trading.buyFall(contract);
+        }
+    }
+
+    private static BigDecimal parseStakeQuiet(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            BigDecimal v = new BigDecimal(raw.trim());
+            return (v.signum() > 0) ? v : null;
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // STREAK (disabled)
+    // -------------------------------------------------------------------------
 
     @Override
     public void decideAndTrade(String symbol, AnalyzeContainer analyze) {
         if (true) {
             return;
         }
-        // TRADING IS DISABLED — remove this block to enable
         if (!tradeWindowState.isAutoTradeEnabled()) {
             return;
         }
@@ -254,12 +317,10 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
             tape.put(nowEpochSecond, level);
 
-            // Same second: skip (1 Hz)
             if (nowEpochSecond == lastProcessedEpochSecond) {
                 return;
             }
 
-            // Gap in ticks → reset streak to avoid phantom signals
             if (lastProcessedEpochSecond >= 0 && (nowEpochSecond - lastProcessedEpochSecond) > 1) {
                 resetStreakLocked();
                 lastProcessedLevel = null;
@@ -425,7 +486,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 LADDER[newIdx].toPlainString(),
                 success ? "SUCCESS" : "FAIL",
                 (rootEx == null ? null : rootEx.toString()),
-                -1L, // no cooldown
+                -1L,
                 resultEpoch,
                 TAPE_KEEP_SECONDS,
                 timelineRle
@@ -561,5 +622,14 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         int durationSeconds() {
             return CONTRACT_DURATION_SECONDS;
         }
+    }
+
+    private static String tsMs() {
+        return java.time.LocalTime.now().format(
+                java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS"));
+    }
+
+    private static String threadName() {
+        return Thread.currentThread().getName();
     }
 }

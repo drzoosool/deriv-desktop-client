@@ -1,5 +1,7 @@
 package com.zoosool.state;
 
+import com.zoosool.deriv.DerivTradingService;
+import com.zoosool.enums.TradeMode;
 import com.zoosool.model.ActiveSymbol;
 import javafx.beans.property.*;
 import javafx.collections.FXCollections;
@@ -16,6 +18,13 @@ public class TradeWindowState {
     private final StringProperty basis    = new SimpleStringProperty("payout");
     private final IntegerProperty duration = new SimpleIntegerProperty(2);
     private final StringProperty stake    = new SimpleStringProperty("");
+
+    // NEW: тип стратегии (радиогруппа), дефолт SNAP
+    private final ObjectProperty<TradeMode> tradeMode = new SimpleObjectProperty<>(TradeMode.SNAP);
+
+    // NEW: направление для метронома, дефолт UP; переиспользуем сервисный enum
+    private final ObjectProperty<DerivTradingService.Direction> direction =
+            new SimpleObjectProperty<>(DerivTradingService.Direction.UP);
 
     private final ObservableList<ActiveSymbol> symbols = FXCollections.observableArrayList();
 
@@ -57,4 +66,14 @@ public class TradeWindowState {
     public BooleanProperty allowEqualsProperty() { return allowEquals; }
     public boolean isAllowEquals() { return allowEquals.get(); }
     public void setAllowEquals(boolean v) { allowEquals.set(v); }
+
+    // NEW: tradeMode
+    public ObjectProperty<TradeMode> tradeModeProperty() { return tradeMode; }
+    public TradeMode getTradeMode() { return tradeMode.get(); }
+    public void setTradeMode(TradeMode v) { tradeMode.set(v); }
+
+    // NEW: direction
+    public ObjectProperty<DerivTradingService.Direction> directionProperty() { return direction; }
+    public DerivTradingService.Direction getDirection() { return direction.get(); }
+    public void setDirection(DerivTradingService.Direction v) { direction.set(v); }
 }

@@ -1,6 +1,8 @@
 package com.zoosool.window;
 
 import com.zoosool.deriv.DerivOperations;
+import com.zoosool.deriv.DerivTradingService;
+import com.zoosool.enums.TradeMode;
 import com.zoosool.model.ActiveSymbol;
 import com.zoosool.model.Contract;
 import com.zoosool.model.DerivSession;
@@ -12,6 +14,7 @@ import javafx.geometry.Pos;
 import javafx.scene.Parent;
 import javafx.scene.control.*;
 import javafx.scene.effect.DropShadow;
+import javafx.scene.input.KeyEvent;
 import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 
@@ -39,6 +42,9 @@ public class DerivClientMainWindow {
     private final Button sellButton         = new Button("SELL");
     private final Button buySellButton      = new Button("BUY/SELL");
     private final Button buySellSmartButton = new Button("BUY/SELL/s");
+
+    // направление для метронома
+    private final Button directionButton = new Button("UP");
 
     private static final String DURATION_UNIT_T = "t";
     private static final String DURATION_UNIT_S = "s";
@@ -159,7 +165,6 @@ public class DerivClientMainWindow {
             }
         });
 
-        // UI → State: юзер выбрал асет в комбобоксе
         selectorCurrentAsset.valueProperty().addListener((obs, oldV, newV) -> {
             if (newV == null) {
                 selectorCurrentAsset.setValue(oldV != null ? oldV : (activeSymbols.isEmpty() ? null : activeSymbols.get(0)));
@@ -176,7 +181,6 @@ public class DerivClientMainWindow {
             safariBridge.redirectIfEnabled();
         });
 
-        // инициализируем стейт первым значением
         if (!activeSymbols.isEmpty()) {
             state.setSelectedAsset(activeSymbols.get(0));
         }
@@ -185,7 +189,6 @@ public class DerivClientMainWindow {
         selectorBasis.getSelectionModel().selectFirst();
         selectorBasis.setEditable(false);
 
-        // UI → State
         selectorBasis.valueProperty().addListener((obs, oldV, newV) -> {
             if (newV == null) {
                 selectorBasis.setValue(oldV != null ? oldV : "payout");
@@ -194,7 +197,6 @@ public class DerivClientMainWindow {
             }
         });
 
-        // State → UI
         state.basisProperty().addListener((obs, oldV, newV) -> {
             if (newV != null && !newV.equals(selectorBasis.getValue())) {
                 Platform.runLater(() -> selectorBasis.setValue(newV));
@@ -205,7 +207,6 @@ public class DerivClientMainWindow {
         selectorDurationTicks.getSelectionModel().selectFirst();
         selectorDurationTicks.setEditable(false);
 
-        // UI → State
         selectorDurationTicks.valueProperty().addListener((obs, oldV, newV) -> {
             if (newV == null) {
                 selectorDurationTicks.setValue(oldV != null ? oldV : 2);
@@ -214,7 +215,6 @@ public class DerivClientMainWindow {
             }
         });
 
-        // State → UI
         state.durationProperty().addListener((obs, oldV, newV) -> {
             if (newV != null && !newV.equals(selectorDurationTicks.getValue())) {
                 Platform.runLater(() -> selectorDurationTicks.setValue(newV.intValue()));
@@ -226,14 +226,12 @@ public class DerivClientMainWindow {
         stakeField.setPrefHeight(34);
         stakeField.setStyle(inputStyle());
 
-        // UI → State
         stakeField.textProperty().addListener((obs, oldV, newV) -> {
             if (!newV.equals(state.getStake())) {
                 state.setStake(newV);
             }
         });
 
-        // State → UI (например сброс после трейда)
         state.stakeProperty().addListener((obs, oldV, newV) -> {
             if (newV != null && !newV.equals(stakeField.getText())) {
                 Platform.runLater(() -> stakeField.setText(newV));
@@ -272,7 +270,6 @@ public class DerivClientMainWindow {
         CheckBox autoTradeCheckBox = new CheckBox("Enable auto-trade");
         autoTradeCheckBox.setSelected(state.isAutoTradeEnabled());
 
-        // UI → State
         autoTradeCheckBox.selectedProperty().addListener((obs, oldV, newV) -> {
             applyCheckBoxStyle(autoTradeCheckBox, newV);
             if (newV != state.isAutoTradeEnabled()) {
@@ -280,7 +277,6 @@ public class DerivClientMainWindow {
             }
         });
 
-        // State → UI
         state.autoTradeEnabledProperty().addListener((obs, oldV, newV) -> {
             if (newV != autoTradeCheckBox.isSelected()) {
                 Platform.runLater(() -> {
@@ -297,7 +293,6 @@ public class DerivClientMainWindow {
         CheckBox redirectCheckBox = new CheckBox("Enable redirect");
         redirectCheckBox.setSelected(state.isRedirectEnabled());
 
-        // UI → State
         redirectCheckBox.selectedProperty().addListener((obs, oldV, newV) -> {
             applyCheckBoxStyle(redirectCheckBox, newV);
             if (newV != state.isRedirectEnabled()) {
@@ -305,7 +300,6 @@ public class DerivClientMainWindow {
             }
         });
 
-        // State → UI
         state.redirectEnabledProperty().addListener((obs, oldV, newV) -> {
             if (newV != redirectCheckBox.isSelected()) {
                 Platform.runLater(() -> {
@@ -318,11 +312,10 @@ public class DerivClientMainWindow {
 
         applyCheckBoxStyle(redirectCheckBox, redirectCheckBox.isSelected());
 
-        // ── Call Type checkbox ───────────────────────────────────────────
+        // ── Allow equals checkbox ────────────────────────────────────────
         CheckBox allowEqualsCheckBox = new CheckBox("Allow equals");
         allowEqualsCheckBox.setSelected(state.isAllowEquals());
 
-        // UI → State
         allowEqualsCheckBox.selectedProperty().addListener((obs, oldV, newV) -> {
             applyCheckBoxStyle(allowEqualsCheckBox, newV);
             if (newV != state.isAllowEquals()) {
@@ -330,7 +323,6 @@ public class DerivClientMainWindow {
             }
         });
 
-        // State → UI
         state.allowEqualsProperty().addListener((obs, oldV, newV) -> {
             if (newV != allowEqualsCheckBox.isSelected()) {
                 Platform.runLater(() -> {
@@ -349,7 +341,72 @@ public class DerivClientMainWindow {
         HBox checkBoxes = new HBox(16, autoTradeCheckBox, redirectCheckBox, allowEqualsCheckBox);
         checkBoxes.setAlignment(Pos.CENTER_LEFT);
 
-        VBox buttonsBox = new VBox(8, buttons, checkBoxes);
+        // ── Strategy mode radio + direction button ───────────────────────
+        ToggleGroup modeGroup = new ToggleGroup();
+        RadioButton snapRadio = new RadioButton("Snap");
+        RadioButton metronomeRadio = new RadioButton("Metronome");
+        snapRadio.setToggleGroup(modeGroup);
+        metronomeRadio.setToggleGroup(modeGroup);
+        snapRadio.setUserData(TradeMode.SNAP);
+        metronomeRadio.setUserData(TradeMode.METRONOME);
+
+        applyRadioStyle(snapRadio);
+        applyRadioStyle(metronomeRadio);
+
+        if (state.getTradeMode() == TradeMode.METRONOME) {
+            metronomeRadio.setSelected(true);
+        } else {
+            snapRadio.setSelected(true);
+        }
+
+        modeGroup.selectedToggleProperty().addListener((obs, oldT, newT) -> {
+            if (newT == null) return;
+            TradeMode mode = (TradeMode) newT.getUserData();
+            if (mode != state.getTradeMode()) {
+                state.setTradeMode(mode);
+                logView.log("Trade mode: " + mode);
+            }
+        });
+
+        state.tradeModeProperty().addListener((obs, oldV, newV) -> {
+            if (newV == null) return;
+            Platform.runLater(() -> {
+                if (newV == TradeMode.METRONOME && !metronomeRadio.isSelected()) {
+                    metronomeRadio.setSelected(true);
+                } else if (newV == TradeMode.SNAP && !snapRadio.isSelected()) {
+                    snapRadio.setSelected(true);
+                }
+            });
+        });
+
+        applyDirectionButtonStyle(directionButton, state.getDirection());
+        directionButton.setPrefHeight(34);
+        directionButton.setMinWidth(90);
+
+        directionButton.setOnAction(e -> {
+            DerivTradingService.Direction cur = state.getDirection();
+            DerivTradingService.Direction next =
+                    (cur == DerivTradingService.Direction.UP)
+                            ? DerivTradingService.Direction.DOWN
+                            : DerivTradingService.Direction.UP;
+            state.setDirection(next);
+        });
+
+        state.directionProperty().addListener((obs, oldV, newV) -> {
+            if (newV == null) return;
+            Platform.runLater(() -> applyDirectionButtonStyle(directionButton, newV));
+        });
+
+        Label modeLabel = new Label("Strategy:");
+        modeLabel.setStyle("""
+                -fx-text-fill: rgba(255,255,255,0.78);
+                -fx-font-size: 12px;
+                """);
+
+        HBox strategyRow = new HBox(12, modeLabel, snapRadio, metronomeRadio, directionButton);
+        strategyRow.setAlignment(Pos.CENTER_LEFT);
+
+        VBox buttonsBox = new VBox(8, buttons, checkBoxes, strategyRow);
 
         styleButtons();
 
@@ -406,10 +463,55 @@ public class DerivClientMainWindow {
 
         card.getChildren().addAll(cardTitle, form, buttonsBox);
         visualArea.getChildren().addAll(header, statsView.getNode(), card, logPane);
+
+        buyButton.setFocusTraversable(false);
+        sellButton.setFocusTraversable(false);
+        buySellButton.setFocusTraversable(false);
+        buySellSmartButton.setFocusTraversable(false);
+        directionButton.setFocusTraversable(false);
+
+        autoTradeCheckBox.setFocusTraversable(false);
+        redirectCheckBox.setFocusTraversable(false);
+        allowEqualsCheckBox.setFocusTraversable(false);
+
+        snapRadio.setFocusTraversable(false);
+        metronomeRadio.setFocusTraversable(false);
+
+        selectorCurrentAsset.setFocusTraversable(false);
+        selectorBasis.setFocusTraversable(false);
+        selectorDurationTicks.setFocusTraversable(false);
     }
 
     public Parent getVisualArea() {
         return visualArea;
+    }
+
+    /**
+     * Горячие клавиши, вешается фильтром на Scene:
+     *   UP / DOWN  — направление ставки (метроном)
+     *   SPACE      — тумблер авто-трейда
+     * Не перехватывает, когда фокус в поле ввода или комбобоксе.
+     */
+    public void handleHotkey(KeyEvent e) {
+        switch (e.getCode()) {
+            case UP -> {
+                state.setDirection(DerivTradingService.Direction.UP);
+                logView.log("Direction: UP (key)");
+                e.consume();
+            }
+            case DOWN -> {
+                state.setDirection(DerivTradingService.Direction.DOWN);
+                logView.log("Direction: DOWN (key)");
+                e.consume();
+            }
+            case SPACE -> {
+                boolean next = !state.isAutoTradeEnabled();
+                state.setAutoTradeEnabled(next);
+                logView.log("Auto-trade toggled by key: " + (next ? "ON" : "OFF"));
+                e.consume();
+            }
+            default -> { }
+        }
     }
 
     private Contract buildContractOrLog() {
@@ -488,6 +590,27 @@ public class DerivClientMainWindow {
                   -fx-mark-color: black;
                   -fx-background-color: rgba(255,255,255,0.15), rgba(255,255,255,0.15), #1e293b;
                   """);
+    }
+
+    private static void applyRadioStyle(RadioButton rb) {
+        rb.setStyle("""
+                -fx-text-fill: rgba(255,255,255,0.85);
+                -fx-font-size: 12px;
+                -fx-mark-color: black;
+                """);
+    }
+
+    private static void applyDirectionButtonStyle(Button b, DerivTradingService.Direction dir) {
+        boolean up = (dir == DerivTradingService.Direction.UP);
+        b.setText(up ? "▲ UP" : "▼ DOWN");
+        b.setStyle("""
+                -fx-background-color: %s;
+                -fx-text-fill: white;
+                -fx-font-weight: 800;
+                -fx-background-radius: 12;
+                -fx-padding: 8 14 8 14;
+                -fx-cursor: hand;
+                """.formatted(up ? "#22c55e" : "#ef4444"));
     }
 
     private void styleButtons() {
