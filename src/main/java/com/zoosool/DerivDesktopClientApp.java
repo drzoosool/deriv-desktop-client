@@ -117,18 +117,33 @@ public class DerivDesktopClientApp extends Application {
     @Override
     public void start(Stage stage) {
         stage.setTitle("Deriv Desktop Client (MVP)");
-        Scene scene = new Scene(derivClientMainWindow.getVisualArea(), 980, 800);
-        scene.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED, derivClientMainWindow::handleHotkey);
+
+        Scene scene = new Scene(derivClientMainWindow.getVisualArea());
+
+        scene.addEventFilter(
+                javafx.scene.input.KeyEvent.KEY_PRESSED,
+                derivClientMainWindow::handleHotkey
+        );
+
         stage.setScene(scene);
         stage.setResizable(true);
         stage.setAlwaysOnTop(true);
+
         stage.show();
+
+        Platform.runLater(() -> {
+            scene.getRoot().applyCss();
+            scene.getRoot().layout();
+            stage.sizeToScene();
+        });
 
         // Periodic ping to keep connection alive + trigger reconnects when disconnected.
         // Note: ping() is non-blocking; it returns a future.
         pingScheduler.scheduleAtFixedRate(
                 () -> connector.ping().exceptionally(ex -> null),
-                10, 20, TimeUnit.SECONDS
+                10,
+                20,
+                TimeUnit.SECONDS
         );
     }
 
