@@ -18,33 +18,43 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Живой график: цена + выбранная MA, ФИКСИРОВАННАЯ ПЛОТНОСТЬ.
+ * Живой график: цена + выбранная MA. Фиксированная плотность по X + независимый
+ * масштаб по Y. 2D-камера:
+ *  - pxPerTick  — плотность по X (сколько пикселей на тик)
+ *  - yZoom      — масштаб по Y (1.0 = видимые тики вписаны в высоту; >1 растянуто)
+ *  - yPan       — вертикальный сдвиг (когда Y растянут)
+ *  - scrollOffset — сдвиг окна по истории (в тиках от правого края)
  *
- * Один тик = pxPerTick пикселей. Показываются только последние тики, что влезают
- * в ширину; старые уезжают влево за кадр. Пока тиков мало — график занимает левую
- * часть и дорастает вправо; когда больше — «лента едет».
+ * Управление (тачпад):
+ *  - щипок (ZoomEvent)      — ОБЩИЙ зум: pxPerTick и yZoom разом (относительно настроенных)
+ *  - гориз. свайп / drag    — пан по истории (X)
+ *  - верт. свайп            — пан по цене (Y), когда растянуто
+ *  - колесо мыши            — общий зум
+ *  - слайдер слева (верт.)  — Y-зум независимо
+ *  - слайдер снизу (гориз.) — X-плотность независимо
+ *  - двойной клик           — сброс к live + дефолты
  *
- * Зум (щипок/колесо) — меняет pxPerTick (тики шире/уже, видно меньше/больше).
- * Пан по X (свайп/drag) — двигает окно в прошлое (в пределах буфера 500).
- * Y — автомасштаб под видимые тики. Двойной клик — назад к «сейчас».
- *
- * MA-значения берутся готовыми из снапшота анализатора, не пересчитываются.
- * Буферы по каждому символу — при переключении картинка видна сразу.
+ * MA берётся готовой из снапшота, не пересчитывается. Буферы по каждому символу.
  */
 public final class TickChartView implements TickStatsSink, Resetable {
 
     private static final int CAPACITY = 500;
-
     private static final int[] MA_PERIODS = {16, 20, 50};
 
-    private static final double PAD_TOP = 14, PAD_BOTTOM = 14, PAD_LEFT = 6, PAD_RIGHT = 58;
+    private static final double PAD_TOP = 14, PAD_BOTTOM = 22, PAD_LEFT = 26, PAD_RIGHT = 58;
 
-    // плотность
     private static final double PX_PER_TICK_DEFAULT = 6.0;
-    private static final double PX_PER_TICK_MIN = 1.5;   // максимально «сжато» (много тиков видно)
-    private static final double PX_PER_TICK_MAX = 40.0;  // максимально «крупно» (мало тиков)
+    private static final double PX_PER_TICK_MIN = 1.5;
+    private static final double PX_PER_TICK_MAX = 40.0;
 
-    /** Кольцевой буфер на один символ: цена + MA по периодам на каждый тик. */
+    private static final double Y_ZOOM_DEFAULT = 1.0;
+    private static final double Y_ZOOM_MIN = 0.3;
+    private static final double Y_ZOOM_MAX = 20.0;
+
+    // размеры слайдеров
+    private static final double SLIDER_THICK = 10.0;   // толщина дорожки
+    private static final double SLIDER_KNOB = 14.0;    // размер ручки
+
     private static final class Ring {
         final double[] prices = new double[CAPACITY];
         final double[][] maValues = new double[MA_PERIODS.length][CAPACITY];
@@ -53,9 +63,7 @@ public final class TickChartView implements TickStatsSink, Resetable {
 
         synchronized void add(double price, double[] maByIndex) {
             prices[head] = price;
-            for (int p = 0; p < MA_PERIODS.length; p++) {
-                maValues[p][head] = maByIndex[p];
-            }
+            for (int p = 0; p < MA_PERIODS.length; p++) maValues[p][head] = maByIndex[p];
             head = (head + 1) % CAPACITY;
             if (size < CAPACITY) size++;
         }
@@ -87,15 +95,18 @@ public final class TickChartView implements TickStatsSink, Resetable {
 
     private final AtomicBoolean dirty = new AtomicBoolean(false);
 
-    // ── камера с фиксированной плотностью ──────────────────────────────
+    // ── 2D камера ──────────────────────────────────────────────────────
     private double pxPerTick = PX_PER_TICK_DEFAULT;
-    // scrollOffset — сколько тиков от правого края мы «отмотали» назад.
-    // 0 = смотрим на самый свежий тик у правого края; >0 = ушли в историю.
-    private int scrollOffset = 0;
-    private boolean followLive = true;   // прилипание к правому краю (свежие тики)
+    private double yZoom = Y_ZOOM_DEFAULT;
+    private double yPan = 0.0;                 // пиксельный сдвиг по вертикали
+    private int scrollOffset = 0;             // тиков от правого края
+    private boolean followLive = true;
 
-    private double lastDragX;
-    private double dragAccumX;            // накопитель дробного пан-сдвига в тиках
+    // drag-состояние
+    private enum Drag { NONE, PAN, SLIDER_X, SLIDER_Y }
+    private Drag dragMode = Drag.NONE;
+    private double lastDragX, lastDragY;
+    private double dragAccumX;
 
     public TickChartView(TradeWindowState state) {
         this.state = Objects.requireNonNull(state, "state");
@@ -114,9 +125,7 @@ public final class TickChartView implements TickStatsSink, Resetable {
         this.currentSymbol = (sel == null) ? null : sel.symbol();
     }
 
-    public Node getNode() {
-        return root;
-    }
+    public Node getNode() { return root; }
 
     private void buildUi() {
         root.setStyle("""
@@ -135,11 +144,57 @@ public final class TickChartView implements TickStatsSink, Resetable {
         canvas.heightProperty().addListener((o, a, b) -> dirty.set(true));
     }
 
+    // ── геометрия слайдеров (в координатах канваса) ────────────────────
+    // Y-слайдер: вертикальная дорожка слева, в зоне PAD_LEFT.
+    // X-слайдер: горизонтальная дорожка снизу, в зоне PAD_BOTTOM.
+    private double[] ySliderTrack() { // {x, yTop, yBottom}
+        double h = canvas.getHeight();
+        double x = PAD_LEFT / 2.0;
+        double yTop = PAD_TOP + 4;
+        double yBottom = h - PAD_BOTTOM - 4;
+        return new double[]{x, yTop, yBottom};
+    }
+    private double[] xSliderTrack() { // {xLeft, xRight, y}
+        double w = canvas.getWidth();
+        double h = canvas.getHeight();
+        double xLeft = PAD_LEFT + 4;
+        double xRight = w - PAD_RIGHT - 4;
+        double y = h - PAD_BOTTOM / 2.0;
+        return new double[]{xLeft, xRight, y};
+    }
+
+    private double yZoomToKnob() { // позиция ручки Y-слайдера (0..1, снизу вверх)
+        double t = (Math.log(yZoom) - Math.log(Y_ZOOM_MIN)) / (Math.log(Y_ZOOM_MAX) - Math.log(Y_ZOOM_MIN));
+        return clamp(t, 0, 1);
+    }
+    private double knobToYZoom(double t) {
+        double v = Math.exp(Math.log(Y_ZOOM_MIN) + clamp(t, 0, 1) * (Math.log(Y_ZOOM_MAX) - Math.log(Y_ZOOM_MIN)));
+        return clamp(v, Y_ZOOM_MIN, Y_ZOOM_MAX);
+    }
+    private double pxToKnob() {
+        double t = (Math.log(pxPerTick) - Math.log(PX_PER_TICK_MIN)) / (Math.log(PX_PER_TICK_MAX) - Math.log(PX_PER_TICK_MIN));
+        return clamp(t, 0, 1);
+    }
+    private double knobToPx(double t) {
+        double v = Math.exp(Math.log(PX_PER_TICK_MIN) + clamp(t, 0, 1) * (Math.log(PX_PER_TICK_MAX) - Math.log(PX_PER_TICK_MIN)));
+        return clamp(v, PX_PER_TICK_MIN, PX_PER_TICK_MAX);
+    }
+
+    private boolean hitYSlider(double px, double py) {
+        double[] t = ySliderTrack();
+        return Math.abs(px - t[0]) <= SLIDER_KNOB && py >= t[1] - SLIDER_KNOB && py <= t[2] + SLIDER_KNOB;
+    }
+    private boolean hitXSlider(double px, double py) {
+        double[] t = xSliderTrack();
+        return Math.abs(py - t[2]) <= SLIDER_KNOB && px >= t[0] - SLIDER_KNOB && px <= t[1] + SLIDER_KNOB;
+    }
+
     private void installInput() {
-        // щипок — меняем плотность вокруг курсора (по X)
+        // щипок — ОБЩИЙ зум обеих осей
         canvas.setOnZoom(e -> {
             double f = e.getZoomFactor();
-            changeDensity(f);
+            pxPerTick = clamp(pxPerTick * f, PX_PER_TICK_MIN, PX_PER_TICK_MAX);
+            yZoom = clamp(yZoom * f, Y_ZOOM_MIN, Y_ZOOM_MAX);
             followLive = false;
             dirty.set(true);
             e.consume();
@@ -149,12 +204,15 @@ public final class TickChartView implements TickStatsSink, Resetable {
             if (e.isInertia()) return;
             boolean touch = e.getTouchCount() > 0;
             if (touch) {
-                // двупальцевый свайп по X — пан по истории
-                panByPixels(e.getDeltaX());
+                // горизонталь — пан по истории; вертикаль — пан по цене
+                panByPixelsX(e.getDeltaX());
+                yPan += e.getDeltaY();
+                followLive = (scrollOffset <= 0) && followLive;
             } else {
-                // колесо — зум плотности
+                // колесо — общий зум
                 double f = e.getDeltaY() > 0 ? 1.1 : (1.0 / 1.1);
-                changeDensity(f);
+                pxPerTick = clamp(pxPerTick * f, PX_PER_TICK_MIN, PX_PER_TICK_MAX);
+                yZoom = clamp(yZoom * f, Y_ZOOM_MIN, Y_ZOOM_MAX);
                 followLive = false;
             }
             dirty.set(true);
@@ -162,14 +220,39 @@ public final class TickChartView implements TickStatsSink, Resetable {
         });
 
         canvas.setOnMousePressed(e -> {
-            lastDragX = e.getX();
-            dragAccumX = 0;
-        });
-        canvas.setOnMouseDragged(e -> {
-            panByPixels(e.getX() - lastDragX);
-            lastDragX = e.getX();
+            double px = e.getX(), py = e.getY();
+            if (hitYSlider(px, py)) {
+                dragMode = Drag.SLIDER_Y;
+                applyYSlider(py);
+            } else if (hitXSlider(px, py)) {
+                dragMode = Drag.SLIDER_X;
+                applyXSlider(px);
+            } else {
+                dragMode = Drag.PAN;
+                lastDragX = px;
+                lastDragY = py;
+                dragAccumX = 0;
+            }
             dirty.set(true);
         });
+
+        canvas.setOnMouseDragged(e -> {
+            double px = e.getX(), py = e.getY();
+            switch (dragMode) {
+                case SLIDER_Y -> applyYSlider(py);
+                case SLIDER_X -> applyXSlider(px);
+                case PAN -> {
+                    panByPixelsX(px - lastDragX);
+                    yPan += py - lastDragY;
+                    lastDragX = px;
+                    lastDragY = py;
+                }
+                default -> { }
+            }
+            dirty.set(true);
+        });
+
+        canvas.setOnMouseReleased(e -> dragMode = Drag.NONE);
 
         canvas.setOnMouseClicked(e -> {
             if (e.getClickCount() == 2) {
@@ -179,36 +262,37 @@ public final class TickChartView implements TickStatsSink, Resetable {
         });
     }
 
-    /** Зум плотности: тики шире/уже. f>1 — крупнее (меньше тиков), f<1 — мельче. */
-    private void changeDensity(double f) {
-        pxPerTick = clamp(pxPerTick * f, PX_PER_TICK_MIN, PX_PER_TICK_MAX);
+    private void applyYSlider(double py) {
+        double[] t = ySliderTrack();
+        double frac = 1.0 - (py - t[1]) / (t[2] - t[1]); // сверху 1, снизу 0
+        yZoom = knobToYZoom(frac);
+        followLive = false;
+    }
+    private void applyXSlider(double px) {
+        double[] t = xSliderTrack();
+        double frac = (px - t[0]) / (t[1] - t[0]);
+        pxPerTick = knobToPx(frac);
+        followLive = false;
     }
 
-    /** Пан: сдвиг мышью/свайпом в пикселях -> в тики истории. Вправо = к свежим. */
-    private void panByPixels(double dxPixels) {
+    private void panByPixelsX(double dxPixels) {
         followLive = false;
-        dragAccumX += dxPixels / pxPerTick;   // сколько тиков сдвинули (дробно копим)
+        dragAccumX += dxPixels / pxPerTick;
         int whole = (int) dragAccumX;
         if (whole != 0) {
-            // тянем вправо (dx>0) -> уменьшаем offset (к свежим); влево -> в историю
-            scrollOffset -= whole;
+            scrollOffset += whole;
             dragAccumX -= whole;
         }
-        clampScroll();
-        // если вернулись к правому краю — снова прилипаем к live
         if (scrollOffset <= 0) {
             scrollOffset = 0;
             followLive = true;
         }
     }
 
-    private void clampScroll() {
-        if (scrollOffset < 0) scrollOffset = 0;
-        // верхнюю границу clamp'ит draw() по фактическому size (там знаем n)
-    }
-
     private void resetView() {
         pxPerTick = PX_PER_TICK_DEFAULT;
+        yZoom = Y_ZOOM_DEFAULT;
+        yPan = 0.0;
         scrollOffset = 0;
         followLive = true;
         dragAccumX = 0;
@@ -221,7 +305,6 @@ public final class TickChartView implements TickStatsSink, Resetable {
     @Override
     public void onSnapshot(TickStatsSnapshot s) {
         if (s == null) return;
-
         String sym = s.symbol();
         if (sym == null) return;
 
@@ -237,9 +320,7 @@ public final class TickChartView implements TickStatsSink, Resetable {
 
         buffers.computeIfAbsent(sym, k -> new Ring()).add(q, maByIndex);
 
-        if (sym.equals(currentSymbol) && canvas.getWidth() > 0) {
-            dirty.set(true);
-        }
+        if (sym.equals(currentSymbol) && canvas.getWidth() > 0) dirty.set(true);
     }
 
     private void startRenderLoop() {
@@ -252,9 +333,7 @@ public final class TickChartView implements TickStatsSink, Resetable {
 
     private int selectedPeriodIndex() {
         int sel = state.getSelectedMaPeriod();
-        for (int p = 0; p < MA_PERIODS.length; p++) {
-            if (MA_PERIODS[p] == sel) return p;
-        }
+        for (int p = 0; p < MA_PERIODS.length; p++) if (MA_PERIODS[p] == sel) return p;
         return -1;
     }
 
@@ -267,11 +346,11 @@ public final class TickChartView implements TickStatsSink, Resetable {
 
         String sym = currentSymbol;
         Ring ring = (sym == null) ? null : buffers.get(sym);
-        if (ring == null) return;
+        if (ring == null) { drawSliders(g); return; }
 
         double[] price = ring.pricesSnapshot();
         int n = price.length;
-        if (n < 2) return;
+        if (n < 2) { drawSliders(g); return; }
 
         double plotW = w - PAD_LEFT - PAD_RIGHT;
         double plotH = h - PAD_TOP - PAD_BOTTOM;
@@ -280,25 +359,20 @@ public final class TickChartView implements TickStatsSink, Resetable {
         int selPi = selectedPeriodIndex();
         double[] ma = (selPi >= 0) ? ring.maSnapshot(selPi) : null;
 
-        // ── определяем видимое окно [from, to) по индексам буфера ─────────
         int visibleCount = (int) Math.floor(plotW / pxPerTick) + 1;
         if (visibleCount < 2) visibleCount = 2;
 
-        // следуем за live -> правый край = последний тик; иначе учитываем scrollOffset
         if (followLive) scrollOffset = 0;
-
-        // clamp scrollOffset по фактическому n
         int maxScroll = Math.max(0, n - visibleCount);
         if (scrollOffset > maxScroll) scrollOffset = maxScroll;
         if (scrollOffset < 0) scrollOffset = 0;
 
-        // to = индекс за последним видимым тиком (правый край)
-        int to = n - scrollOffset;                 // exclusive
-        int from = Math.max(0, to - visibleCount);  // inclusive
-        int m = to - from;                          // сколько тиков видно
-        if (m < 2) return;
+        int to = n - scrollOffset;
+        int from = Math.max(0, to - visibleCount);
+        int m = to - from;
+        if (m < 2) { drawSliders(g); return; }
 
-        // ── Y-масштаб под ВИДИМЫЕ тики (цена + видимая MA) ────────────────
+        // Y: база — видимые тики вписаны в высоту при yZoom=1, дальше растягиваем
         double min = Double.MAX_VALUE, max = -Double.MAX_VALUE;
         for (int i = from; i < to; i++) {
             double v = price[i];
@@ -307,25 +381,30 @@ public final class TickChartView implements TickStatsSink, Resetable {
         }
         double range = max - min;
         if (range <= 0) range = 1;
+        double mid = (min + max) / 2.0;
 
-        // X: тик i рисуется в PAD_LEFT + (i - from) * pxPerTick, прижатый к правому краю.
-        // Чтобы последний видимый тик был у правого края плота:
-        double rightAlign = plotW - (m - 1) * pxPerTick; // сдвиг, чтобы последний тик = правый край
+        double rightAlign = plotW - (m - 1) * pxPerTick;
         double baseX = PAD_LEFT + Math.max(0, rightAlign);
 
-        // ── линия цены (чёрная) ──────────────────────────────────────────
+        // функция цены -> экранный Y с учётом yZoom и yPan
+        // при yZoom=1 диапазон [min..max] занимает всю высоту плота (центр = mid).
+        double plotCY = PAD_TOP + plotH / 2.0;
+        // пикселей на единицу цены при yZoom=1: plotH/range; c зумом умножаем
+        double pxPerPrice = (plotH / range) * yZoom;
+
+        // ── линия цены ────────────────────────────────────────────────
         g.setStroke(Color.web("#111111"));
         g.setLineWidth(1.4);
         g.beginPath();
         for (int i = from; i < to; i++) {
             double x = baseX + (i - from) * pxPerTick;
-            double y = PAD_TOP + plotH * (1.0 - (price[i] - min) / range);
+            double y = plotCY - (price[i] - mid) * pxPerPrice + yPan;
             if (i == from) g.moveTo(x, y);
             else g.lineTo(x, y);
         }
         g.stroke();
 
-        // ── выбранная MA (красная), разрыв на NaN ────────────────────────
+        // ── MA ────────────────────────────────────────────────────────
         if (ma != null) {
             g.setStroke(Color.web("#dc2626"));
             g.setLineWidth(1.2);
@@ -335,30 +414,52 @@ public final class TickChartView implements TickStatsSink, Resetable {
                 double v = ma[i];
                 if (Double.isNaN(v)) { started = false; continue; }
                 double x = baseX + (i - from) * pxPerTick;
-                double y = PAD_TOP + plotH * (1.0 - (v - min) / range);
+                double y = plotCY - (v - mid) * pxPerPrice + yPan;
                 if (!started) { g.moveTo(x, y); started = true; }
                 else g.lineTo(x, y);
             }
             g.stroke();
         }
 
-        // ── метка последней ВИДИМОЙ цены ─────────────────────────────────
+        // ── метка последней цены ──────────────────────────────────────
         double last = price[to - 1];
-        double yLast = PAD_TOP + plotH * (1.0 - (last - min) / range);
+        double yLast = plotCY - (last - mid) * pxPerPrice + yPan;
         g.setStroke(Color.web("#16a34a", 0.55));
         g.setLineWidth(1.0);
         g.strokeLine(PAD_LEFT, yLast, PAD_LEFT + plotW, yLast);
         g.setFill(Color.web("#15803d"));
         g.fillText(String.format(java.util.Locale.US, "%.4f", last), PAD_LEFT + plotW + 4, yLast + 4);
 
-        // ── подпись ──────────────────────────────────────────────────────
+        // ── подпись ────────────────────────────────────────────────────
         int selPeriod = state.getSelectedMaPeriod();
-        String info = (sym == null ? "" : sym) + "  " + n + " ticks"
-                + "  MA" + selPeriod
-                + "  px/tick=" + String.format(java.util.Locale.US, "%.1f", pxPerTick)
-                + (followLive ? "  [LIVE]" : "  [-" + scrollOffset + "]  (dbl-click = live)");
+        String info = (sym == null ? "" : sym) + "  " + n + "t  MA" + selPeriod
+                + "  x" + String.format(java.util.Locale.US, "%.1f", pxPerTick)
+                + "  y" + String.format(java.util.Locale.US, "%.1f", yZoom)
+                + (followLive ? "  LIVE" : "  -" + scrollOffset);
         g.setFill(Color.web("#334155"));
         g.fillText(info, PAD_LEFT + 2, PAD_TOP);
+
+        drawSliders(g);
+    }
+
+    private void drawSliders(GraphicsContext g) {
+        // Y-слайдер (вертикальный, слева)
+        double[] ys = ySliderTrack();
+        g.setStroke(Color.web("#cbd5e1"));
+        g.setLineWidth(SLIDER_THICK);
+        g.strokeLine(ys[0], ys[1], ys[0], ys[2]);
+        double yk = ys[2] - yZoomToKnob() * (ys[2] - ys[1]);
+        g.setFill(Color.web("#2563eb"));
+        g.fillOval(ys[0] - SLIDER_KNOB / 2, yk - SLIDER_KNOB / 2, SLIDER_KNOB, SLIDER_KNOB);
+
+        // X-слайдер (горизонтальный, снизу)
+        double[] xs = xSliderTrack();
+        g.setStroke(Color.web("#cbd5e1"));
+        g.setLineWidth(SLIDER_THICK);
+        g.strokeLine(xs[0], xs[2], xs[1], xs[2]);
+        double xk = xs[0] + pxToKnob() * (xs[1] - xs[0]);
+        g.setFill(Color.web("#2563eb"));
+        g.fillOval(xk - SLIDER_KNOB / 2, xs[2] - SLIDER_KNOB / 2, SLIDER_KNOB, SLIDER_KNOB);
     }
 
     @Override
