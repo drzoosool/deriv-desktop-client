@@ -18,32 +18,35 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Живой график: цена + выбранная MA.
+ * Живой график: цена + выбранная MA, ФИКСИРОВАННАЯ ПЛОТНОСТЬ.
  *
- * MA-значения НЕ пересчитываются — берутся готовыми из снапшота анализатора
- * (snapshot.movingAverages()). Копим по каждому символу цену + все MA (16/20/50);
- * на отрисовке рисуем выбранную (state.selectedMaPeriod). Переключение MA буфер
- * не трогает — меняется только индекс ряда при рисовании.
+ * Один тик = pxPerTick пикселей. Показываются только последние тики, что влезают
+ * в ширину; старые уезжают влево за кадр. Пока тиков мало — график занимает левую
+ * часть и дорастает вправо; когда больше — «лента едет».
  *
- * Буферы по каждому символу — при переключении символа картинка видна сразу.
+ * Зум (щипок/колесо) — меняет pxPerTick (тики шире/уже, видно меньше/больше).
+ * Пан по X (свайп/drag) — двигает окно в прошлое (в пределах буфера 500).
+ * Y — автомасштаб под видимые тики. Двойной клик — назад к «сейчас».
  *
- * Управление (тачпад):
- *  - щипок (ZoomEvent) — зум обеих осей вокруг курсора
- *  - двупальцевый свайп (ScrollEvent touch) — пан
- *  - колесо мыши — зум
- *  - двойной клик — сброс к «живому» виду
+ * MA-значения берутся готовыми из снапшота анализатора, не пересчитываются.
+ * Буферы по каждому символу — при переключении картинка видна сразу.
  */
 public final class TickChartView implements TickStatsSink, Resetable {
 
     private static final int CAPACITY = 500;
 
-    // периоды, которые график умеет показывать (должны совпадать с теми, что кладёт анализатор)
     private static final int[] MA_PERIODS = {16, 20, 50};
+
+    private static final double PAD_TOP = 14, PAD_BOTTOM = 14, PAD_LEFT = 6, PAD_RIGHT = 58;
+
+    // плотность
+    private static final double PX_PER_TICK_DEFAULT = 6.0;
+    private static final double PX_PER_TICK_MIN = 1.5;   // максимально «сжато» (много тиков видно)
+    private static final double PX_PER_TICK_MAX = 40.0;  // максимально «крупно» (мало тиков)
 
     /** Кольцевой буфер на один символ: цена + MA по периодам на каждый тик. */
     private static final class Ring {
         final double[] prices = new double[CAPACITY];
-        // maValues[periodIndex][slot] — значение MA данного периода (NaN = не прогрета)
         final double[][] maValues = new double[MA_PERIODS.length][CAPACITY];
         int size = 0;
         int head = 0;
@@ -84,13 +87,15 @@ public final class TickChartView implements TickStatsSink, Resetable {
 
     private final AtomicBoolean dirty = new AtomicBoolean(false);
 
-    // камера
-    private boolean live = true;
-    private double scaleX = 1.0;
-    private double scaleY = 1.0;
-    private double offsetX = 0.0;
-    private double offsetY = 0.0;
-    private double lastDragX, lastDragY;
+    // ── камера с фиксированной плотностью ──────────────────────────────
+    private double pxPerTick = PX_PER_TICK_DEFAULT;
+    // scrollOffset — сколько тиков от правого края мы «отмотали» назад.
+    // 0 = смотрим на самый свежий тик у правого края; >0 = ушли в историю.
+    private int scrollOffset = 0;
+    private boolean followLive = true;   // прилипание к правому краю (свежие тики)
+
+    private double lastDragX;
+    private double dragAccumX;            // накопитель дробного пан-сдвига в тиках
 
     public TickChartView(TradeWindowState state) {
         this.state = Objects.requireNonNull(state, "state");
@@ -100,10 +105,9 @@ public final class TickChartView implements TickStatsSink, Resetable {
 
         state.selectedAssetProperty().addListener((obs, oldV, newV) -> {
             currentSymbol = (newV == null) ? null : newV.symbol();
-            resetCamera();
+            resetView();
             dirty.set(true);
         });
-        // перерисовать при смене выбранной MA (буфер не трогаем)
         state.selectedMaPeriodProperty().addListener((o, a, b) -> dirty.set(true));
 
         var sel = state.getSelectedAsset();
@@ -132,10 +136,11 @@ public final class TickChartView implements TickStatsSink, Resetable {
     }
 
     private void installInput() {
+        // щипок — меняем плотность вокруг курсора (по X)
         canvas.setOnZoom(e -> {
             double f = e.getZoomFactor();
-            zoomAround(e.getX(), e.getY(), f, f);
-            live = false;
+            changeDensity(f);
+            followLive = false;
             dirty.set(true);
             e.consume();
         });
@@ -144,13 +149,13 @@ public final class TickChartView implements TickStatsSink, Resetable {
             if (e.isInertia()) return;
             boolean touch = e.getTouchCount() > 0;
             if (touch) {
-                offsetX += e.getDeltaX();
-                offsetY += e.getDeltaY();
-                live = false;
+                // двупальцевый свайп по X — пан по истории
+                panByPixels(e.getDeltaX());
             } else {
+                // колесо — зум плотности
                 double f = e.getDeltaY() > 0 ? 1.1 : (1.0 / 1.1);
-                zoomAround(e.getX(), e.getY(), f, f);
-                live = false;
+                changeDensity(f);
+                followLive = false;
             }
             dirty.set(true);
             e.consume();
@@ -158,38 +163,55 @@ public final class TickChartView implements TickStatsSink, Resetable {
 
         canvas.setOnMousePressed(e -> {
             lastDragX = e.getX();
-            lastDragY = e.getY();
+            dragAccumX = 0;
         });
         canvas.setOnMouseDragged(e -> {
-            offsetX += e.getX() - lastDragX;
-            offsetY += e.getY() - lastDragY;
+            panByPixels(e.getX() - lastDragX);
             lastDragX = e.getX();
-            lastDragY = e.getY();
-            live = false;
             dirty.set(true);
         });
 
         canvas.setOnMouseClicked(e -> {
             if (e.getClickCount() == 2) {
-                resetCamera();
+                resetView();
                 dirty.set(true);
             }
         });
     }
 
-    private void zoomAround(double px, double py, double fx, double fy) {
-        offsetX = px - (px - offsetX) * fx;
-        offsetY = py - (py - offsetY) * fy;
-        scaleX = clamp(scaleX * fx, 0.05, 50);
-        scaleY = clamp(scaleY * fy, 0.05, 50);
+    /** Зум плотности: тики шире/уже. f>1 — крупнее (меньше тиков), f<1 — мельче. */
+    private void changeDensity(double f) {
+        pxPerTick = clamp(pxPerTick * f, PX_PER_TICK_MIN, PX_PER_TICK_MAX);
     }
 
-    private void resetCamera() {
-        live = true;
-        scaleX = 1.0;
-        scaleY = 1.0;
-        offsetX = 0.0;
-        offsetY = 0.0;
+    /** Пан: сдвиг мышью/свайпом в пикселях -> в тики истории. Вправо = к свежим. */
+    private void panByPixels(double dxPixels) {
+        followLive = false;
+        dragAccumX += dxPixels / pxPerTick;   // сколько тиков сдвинули (дробно копим)
+        int whole = (int) dragAccumX;
+        if (whole != 0) {
+            // тянем вправо (dx>0) -> уменьшаем offset (к свежим); влево -> в историю
+            scrollOffset -= whole;
+            dragAccumX -= whole;
+        }
+        clampScroll();
+        // если вернулись к правому краю — снова прилипаем к live
+        if (scrollOffset <= 0) {
+            scrollOffset = 0;
+            followLive = true;
+        }
+    }
+
+    private void clampScroll() {
+        if (scrollOffset < 0) scrollOffset = 0;
+        // верхнюю границу clamp'ит draw() по фактическому size (там знаем n)
+    }
+
+    private void resetView() {
+        pxPerTick = PX_PER_TICK_DEFAULT;
+        scrollOffset = 0;
+        followLive = true;
+        dragAccumX = 0;
     }
 
     private static double clamp(double v, double lo, double hi) {
@@ -206,12 +228,11 @@ public final class TickChartView implements TickStatsSink, Resetable {
         Double q = s.lastQuote();
         if (q == null || q.isNaN() || q.isInfinite()) return;
 
-        // достаём готовые MA из снапшота (НЕ пересчитываем)
         Map<Integer, MaPoint> mas = s.movingAverages();
         double[] maByIndex = new double[MA_PERIODS.length];
         for (int p = 0; p < MA_PERIODS.length; p++) {
             MaPoint mp = (mas == null) ? null : mas.get(MA_PERIODS[p]);
-            maByIndex[p] = (mp == null) ? Double.NaN : mp.value();  // NaN = не прогрета
+            maByIndex[p] = (mp == null) ? Double.NaN : mp.value();
         }
 
         buffers.computeIfAbsent(sym, k -> new Ring()).add(q, maByIndex);
@@ -234,7 +255,7 @@ public final class TickChartView implements TickStatsSink, Resetable {
         for (int p = 0; p < MA_PERIODS.length; p++) {
             if (MA_PERIODS[p] == sel) return p;
         }
-        return -1; // выбранного периода нет среди известных — MA не рисуем
+        return -1;
     }
 
     private void draw() {
@@ -252,75 +273,93 @@ public final class TickChartView implements TickStatsSink, Resetable {
         int n = price.length;
         if (n < 2) return;
 
-        // масштаб по цене
+        double plotW = w - PAD_LEFT - PAD_RIGHT;
+        double plotH = h - PAD_TOP - PAD_BOTTOM;
+        if (plotW <= 0 || plotH <= 0) return;
+
+        int selPi = selectedPeriodIndex();
+        double[] ma = (selPi >= 0) ? ring.maSnapshot(selPi) : null;
+
+        // ── определяем видимое окно [from, to) по индексам буфера ─────────
+        int visibleCount = (int) Math.floor(plotW / pxPerTick) + 1;
+        if (visibleCount < 2) visibleCount = 2;
+
+        // следуем за live -> правый край = последний тик; иначе учитываем scrollOffset
+        if (followLive) scrollOffset = 0;
+
+        // clamp scrollOffset по фактическому n
+        int maxScroll = Math.max(0, n - visibleCount);
+        if (scrollOffset > maxScroll) scrollOffset = maxScroll;
+        if (scrollOffset < 0) scrollOffset = 0;
+
+        // to = индекс за последним видимым тиком (правый край)
+        int to = n - scrollOffset;                 // exclusive
+        int from = Math.max(0, to - visibleCount);  // inclusive
+        int m = to - from;                          // сколько тиков видно
+        if (m < 2) return;
+
+        // ── Y-масштаб под ВИДИМЫЕ тики (цена + видимая MA) ────────────────
         double min = Double.MAX_VALUE, max = -Double.MAX_VALUE;
-        for (double v : price) {
+        for (int i = from; i < to; i++) {
+            double v = price[i];
             if (v < min) min = v;
             if (v > max) max = v;
         }
         double range = max - min;
         if (range <= 0) range = 1;
 
-        double padTop = 14, padBottom = 14, padLeft = 6, padRight = 58;
-        double plotW = w - padLeft - padRight;
-        double plotH = h - padTop - padBottom;
-        if (plotW <= 0 || plotH <= 0) return;
+        // X: тик i рисуется в PAD_LEFT + (i - from) * pxPerTick, прижатый к правому краю.
+        // Чтобы последний видимый тик был у правого края плота:
+        double rightAlign = plotW - (m - 1) * pxPerTick; // сдвиг, чтобы последний тик = правый край
+        double baseX = PAD_LEFT + Math.max(0, rightAlign);
 
         // ── линия цены (чёрная) ──────────────────────────────────────────
         g.setStroke(Color.web("#111111"));
         g.setLineWidth(1.4);
         g.beginPath();
-        for (int i = 0; i < n; i++) {
-            double bx = padLeft + plotW * (i / (double) (n - 1));
-            double by = padTop + plotH * (1.0 - (price[i] - min) / range);
-            double x = cameraX(bx);
-            double y = cameraY(by);
-            if (i == 0) g.moveTo(x, y);
+        for (int i = from; i < to; i++) {
+            double x = baseX + (i - from) * pxPerTick;
+            double y = PAD_TOP + plotH * (1.0 - (price[i] - min) / range);
+            if (i == from) g.moveTo(x, y);
             else g.lineTo(x, y);
         }
         g.stroke();
 
         // ── выбранная MA (красная), разрыв на NaN ────────────────────────
-        int pi = selectedPeriodIndex();
-        if (pi >= 0) {
-            double[] ma = ring.maSnapshot(pi);
+        if (ma != null) {
             g.setStroke(Color.web("#dc2626"));
             g.setLineWidth(1.2);
             g.beginPath();
             boolean started = false;
-            for (int i = 0; i < n; i++) {
+            for (int i = from; i < to; i++) {
                 double v = ma[i];
-                if (Double.isNaN(v)) { started = false; continue; }  // не прогрета — разрыв
-                double bx = padLeft + plotW * (i / (double) (n - 1));
-                double by = padTop + plotH * (1.0 - (v - min) / range);
-                double x = cameraX(bx);
-                double y = cameraY(by);
+                if (Double.isNaN(v)) { started = false; continue; }
+                double x = baseX + (i - from) * pxPerTick;
+                double y = PAD_TOP + plotH * (1.0 - (v - min) / range);
                 if (!started) { g.moveTo(x, y); started = true; }
                 else g.lineTo(x, y);
             }
             g.stroke();
         }
 
-        // ── метка последней цены ─────────────────────────────────────────
-        double last = price[n - 1];
-        double byLast = padTop + plotH * (1.0 - (last - min) / range);
-        double yLast = cameraY(byLast);
+        // ── метка последней ВИДИМОЙ цены ─────────────────────────────────
+        double last = price[to - 1];
+        double yLast = PAD_TOP + plotH * (1.0 - (last - min) / range);
         g.setStroke(Color.web("#16a34a", 0.55));
         g.setLineWidth(1.0);
-        g.strokeLine(padLeft, yLast, padLeft + plotW, yLast);
+        g.strokeLine(PAD_LEFT, yLast, PAD_LEFT + plotW, yLast);
         g.setFill(Color.web("#15803d"));
-        g.fillText(String.format(java.util.Locale.US, "%.4f", last), padLeft + plotW + 4, yLast + 4);
+        g.fillText(String.format(java.util.Locale.US, "%.4f", last), PAD_LEFT + plotW + 4, yLast + 4);
 
         // ── подпись ──────────────────────────────────────────────────────
         int selPeriod = state.getSelectedMaPeriod();
+        String info = (sym == null ? "" : sym) + "  " + n + " ticks"
+                + "  MA" + selPeriod
+                + "  px/tick=" + String.format(java.util.Locale.US, "%.1f", pxPerTick)
+                + (followLive ? "  [LIVE]" : "  [-" + scrollOffset + "]  (dbl-click = live)");
         g.setFill(Color.web("#334155"));
-        g.fillText((sym == null ? "" : sym) + "  " + n + " ticks  MA" + selPeriod
-                        + (live ? "" : "  [zoom]  (dbl-click = reset)"),
-                padLeft + 2, padTop);
+        g.fillText(info, PAD_LEFT + 2, PAD_TOP);
     }
-
-    private double cameraX(double baseX) { return offsetX + baseX * scaleX; }
-    private double cameraY(double baseY) { return offsetY + baseY * scaleY; }
 
     @Override
     public void reset() {
