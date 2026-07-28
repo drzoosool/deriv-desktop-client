@@ -26,6 +26,9 @@ public class TradeWindowState {
     private final ObjectProperty<DerivTradingService.Direction> direction =
             new SimpleObjectProperty<>(DerivTradingService.Direction.UP);
 
+    // NEW: выбранная MA для отрисовки на графике, дефолт 16
+    private final IntegerProperty selectedMaPeriod = new SimpleIntegerProperty(16);
+
     private final ObservableList<ActiveSymbol> symbols = FXCollections.observableArrayList();
 
     // symbols
@@ -76,4 +79,9 @@ public class TradeWindowState {
     public ObjectProperty<DerivTradingService.Direction> directionProperty() { return direction; }
     public DerivTradingService.Direction getDirection() { return direction.get(); }
     public void setDirection(DerivTradingService.Direction v) { direction.set(v); }
+
+    // NEW: selectedMaPeriod
+    public IntegerProperty selectedMaPeriodProperty() { return selectedMaPeriod; }
+    public int getSelectedMaPeriod() { return selectedMaPeriod.get(); }
+    public void setSelectedMaPeriod(int v) { selectedMaPeriod.set(v); }
 }

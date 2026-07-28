@@ -4,6 +4,7 @@ import com.zoosool.enums.TickDecision;
 import com.zoosool.enums.TickStatsState;
 
 import java.time.Instant;
+import java.util.Map;
 import java.util.Objects;
 
 public record TickStatsSnapshot(
@@ -33,7 +34,7 @@ public record TickStatsSnapshot(
         String reason,    // optional: ban/reset reason
         Instant at,        // snapshot time
 
-        Integer maSide
+        Map<Integer, MaPoint> movingAverages
 ) {
     public TickStatsSnapshot {
         Objects.requireNonNull(symbol, "symbol");

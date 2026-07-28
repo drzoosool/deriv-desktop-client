@@ -177,13 +177,36 @@ public class DerivClientMainWindow {
                 -fx-border-radius: 999;
                 """);
 
-        header.getChildren().addAll(
-                title,
-                badge,
-                chartToggleButton,
-                headerSpacer,
-                status
-        );
+        // ── MA selector (для графика) ─────────────────────────────────────
+        Label maLabel = new Label("MA:");
+        maLabel.setStyle("""
+        -fx-text-fill: rgba(255,255,255,0.78);
+        -fx-font-size: 12px;
+        """);
+
+        ComboBox<Integer> maSelector = new ComboBox<>(observableArrayList(16, 20, 50));
+        maSelector.setValue(state.getSelectedMaPeriod());
+        maSelector.setEditable(false);
+        maSelector.setFocusTraversable(false);
+        maSelector.setPrefHeight(28);
+        styleComboBox(maSelector);
+        applyDarkComboBoxCells(maSelector);
+
+        maSelector.valueProperty().addListener((obs, oldV, newV) -> {
+            if (newV == null) {
+                maSelector.setValue(oldV != null ? oldV : 16);
+            } else if (newV != state.getSelectedMaPeriod()) {
+                state.setSelectedMaPeriod(newV);
+            }
+        });
+
+        state.selectedMaPeriodProperty().addListener((obs, oldV, newV) -> {
+            if (newV != null && newV.intValue() != (maSelector.getValue() == null ? -1 : maSelector.getValue())) {
+                Platform.runLater(() -> maSelector.setValue(newV.intValue()));
+            }
+        });
+
+        header.getChildren().addAll(title, badge, chartToggleButton, maLabel, maSelector, status);
 
         /*
          * ─────────────────────────────────────────────────────────────

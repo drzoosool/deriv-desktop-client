@@ -6,6 +6,7 @@ import com.zoosool.deriv.DerivTradingService;
 import com.zoosool.enums.TradeMode;
 import com.zoosool.model.AnalyzeContainer;
 import com.zoosool.model.Contract;
+import com.zoosool.model.MaPoint;
 import com.zoosool.model.TickStatsSnapshot;
 import com.zoosool.state.TradeWindowState;
 
@@ -14,6 +15,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -147,7 +149,9 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
     private void handleSnap(String symbol, TickStatsSnapshot snapshot) {
         Integer xmaShort = snapshot.xmaShort();
-        Integer maSide   = snapshot.maSide();   // +1 above MA16 / -1 below / 0 equal; null=warmup
+        Map<Integer, MaPoint> mas = snapshot.movingAverages();
+        MaPoint ma16 = (mas == null) ? null : mas.get(16);
+        Integer maSide = (ma16 == null) ? null : ma16.side();
 
         if (xmaShort == null || maSide == null) return;
         if (xmaShort != 0) return;

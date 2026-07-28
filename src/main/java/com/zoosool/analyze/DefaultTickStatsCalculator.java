@@ -1,41 +1,28 @@
 package com.zoosool.analyze;
 
-import com.zoosool.enums.TickAction;
 import com.zoosool.enums.TickDecision;
 import com.zoosool.enums.TickStatsState;
+import com.zoosool.model.MaPoint;
 import com.zoosool.model.TickEvent;
 import com.zoosool.model.TickStatsSnapshot;
 
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
-/**
- * Calculates:
- * - ADL (Average Directional Length) for L and S windows
- * - MA crossings for L and S windows (MA length = MA_WINDOW)
- * - MA side aggregate for L and S windows (sum of sign(price - ma) over window):
- *     > 0  => price mostly ABOVE ma
- *     < 0  => price mostly BELOW ma
- *     == 0 => balanced
- * - zero-delta anomalies (ban if >= ZERO_DELTA_BAN_THRESHOLD in S window)
- *
- * Emission:
- * - pushes TickStatsSnapshot to TickStatsSink every tick (1 tick = 1 sec)
- *
- * NOTE:
- * Decision is intentionally NOT computed here.
- */
 public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
-    // ====== Tuning knobs (static for now) ======
     public static final int LONG_WINDOW = 120;
     public static final int SHORT_WINDOW = 30;
     public static final int MA_WINDOW = 16;
 
     public static final int ZERO_DELTA_BAN_THRESHOLD = 2;
 
-    // ====== State ======
+    // периоды MA для сбора значений/стороны/пересечений (на текущем тике)
+    private static final int[] MA_PERIODS = {16, 20, 50};
+
     private final String symbol;
     private final TickStatsSink sink;
 
@@ -44,6 +31,9 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
     private int head = 0;
 
     private String lastQuoteText = null;
+
+    // память знака (price - ma) по каждому периоду — для пересечений на текущем тике
+    private final Map<Integer, Integer> prevMaSign = new java.util.HashMap<>();
 
     public DefaultTickStatsCalculator(String symbol, TickStatsSink sink) {
         this.symbol = Objects.requireNonNull(symbol, "symbol");
@@ -54,33 +44,21 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
     public void onEvent(TickEvent event) {
         Objects.requireNonNull(event, "event");
 
-        if (event.action() == TickAction.RESET) {
-            reset();
-            // Warmup snapshot immediately after reset — MA side unknown yet => null, null
-            sink.onSnapshot(new TickStatsSnapshot(
-                    symbol,
-                    TickStatsState.WARMUP_S,
-                    TickDecision.NA,
-                    LONG_WINDOW, SHORT_WINDOW, MA_WINDOW,
-                    0, 0,
-                    null, null,
-                    null, null,
-                    null,            // lastQuote (Double)
-                    null,            // lastQuoteText (String)
-                    0,
-                    "RESET",
-                    Instant.now(),
-                    null
-            ));
-            return;
-        }
-
-        if (event.action() == TickAction.STOP) {
-            return;
-        }
-
-        if (event.action() != TickAction.TICK) {
-            return;
+        switch (event.action()) {
+            case RESET -> {
+                reset();
+                sink.onSnapshot(warmupSnapshot());
+                return;
+            }
+            case STOP -> {
+                return;
+            }
+            case TICK -> {
+                // fallthrough ниже
+            }
+            default -> {
+                return;
+            }
         }
 
         String qText = event.quote();
@@ -94,13 +72,11 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         } catch (NumberFormatException ex) {
             return;
         }
-
         if (Double.isNaN(q) || Double.isInfinite(q)) {
             return;
         }
 
         lastQuoteText = qText;
-
         appendQuote(q);
 
         sink.onSnapshot(buildSnapshot());
@@ -111,6 +87,7 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         size = 0;
         head = 0;
         lastQuoteText = null;
+        prevMaSign.clear();
 
         if (sink instanceof Resetable) {
             ((Resetable) sink).reset();
@@ -123,6 +100,23 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         if (size < LONG_WINDOW) {
             size++;
         }
+    }
+
+    private TickStatsSnapshot warmupSnapshot() {
+        return new TickStatsSnapshot(
+                symbol,
+                TickStatsState.WARMUP_S,
+                TickDecision.NA,
+                LONG_WINDOW, SHORT_WINDOW, MA_WINDOW,
+                0, 0,
+                null, null,
+                null, null,
+                null, null,
+                0,
+                "RESET",
+                Instant.now(),
+                Map.of()                 // movingAverages пусто на warmup
+        );
     }
 
     private TickStatsSnapshot buildSnapshot() {
@@ -139,8 +133,6 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         Integer xmaShort = (hasMA && hasShort) ? computeMaCrossings(bufShort) : null;
         Integer xmaLong = (hasMA && hasLong) ? computeMaCrossings(bufLong) : null;
 
-        Integer maSide = (size >= MA_WINDOW) ? computeMaSide() : null;
-
         int zeroShort = hasShort ? computeZeroDeltas(bufShort) : 0;
 
         boolean banned = hasShort && zeroShort >= ZERO_DELTA_BAN_THRESHOLD;
@@ -155,6 +147,8 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
         Double lastQuote = (size > 0) ? lastQuote() : null;
         String lastQuoteString = (size > 0) ? lastQuoteText : null;
+
+        Map<Integer, MaPoint> movingAverages = computeMovingAverages(lastQuote);
 
         return new TickStatsSnapshot(
                 symbol,
@@ -174,8 +168,56 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                 zeroShort,
                 reason,
                 Instant.now(),
-                maSide
+                movingAverages
         );
+    }
+
+    // ── MA value + side + crossing on current tick ───────────────────────
+    // На ТЕКУЩЕЙ точке: значение MA, сторона (знак price-ma) и факт пересечения
+    // (смена знака относительно прошлого тика). Без прохода по окну.
+    private Map<Integer, MaPoint> computeMovingAverages(Double lastQuoteVal) {
+        if (lastQuoteVal == null) {
+            return Map.of();
+        }
+
+        Map<Integer, MaPoint> mas = new LinkedHashMap<>();
+
+        for (int period : MA_PERIODS) {
+            Double ma = computeMaLast(period);
+            if (ma == null) {
+                // не прогрелась — не кладём ключ и знак не обновляем
+                continue;
+            }
+
+            int sign = Double.compare(lastQuoteVal, ma); // +1 выше, -1 ниже, 0 равно
+
+            Integer prev = prevMaSign.get(period);
+            int cross = 0;
+            if (prev != null && prev != 0 && sign != 0 && sign != prev) {
+                cross = sign; // +1 пересёк снизу вверх, -1 сверху вниз
+            }
+            prevMaSign.put(period, sign);
+
+            mas.put(period, new MaPoint(period, ma, sign, cross));
+        }
+
+        return Map.copyOf(mas);
+    }
+
+    /** MA по period точкам от последней записанной точки. Не трогает computeMaAt. */
+    private Double computeMaLast(int period) {
+        if (size < period) return null;
+
+        int last = head - 1;
+        if (last < 0) last += LONG_WINDOW;
+
+        double sum = 0.0;
+        for (int k = 0; k < period; k++) {
+            int idx = last - k;
+            if (idx < 0) idx += LONG_WINDOW;
+            sum += quotes[idx];
+        }
+        return sum / period;
     }
 
     private double lastQuote() {
@@ -257,18 +299,6 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
             prevSide = side;
         }
         return crossings;
-    }
-
-    private int computeMaSide() {
-        if (size < MA_WINDOW) return 0; // MA16 ещё не набралась
-
-        int last = head - 1;
-        if (last < 0) last += LONG_WINDOW;
-
-        double ma = computeMaAt(last);   // среднее за последние 16 тиков
-        double price = quotes[last];     // цена текущего тика
-
-        return Double.compare(price - ma, 0.0); // +1 / 0 / -1
     }
 
     private int computeZeroDeltas(int windowSize) {
