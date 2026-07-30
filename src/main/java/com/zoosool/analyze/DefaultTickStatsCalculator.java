@@ -4,11 +4,15 @@ import com.zoosool.enums.TickDecision;
 import com.zoosool.enums.TickStatsState;
 import com.zoosool.model.MaPoint;
 import com.zoosool.model.TickEvent;
+import com.zoosool.model.TickSample;
 import com.zoosool.model.TickStatsSnapshot;
 
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -20,6 +24,8 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
     public static final int ZERO_DELTA_BAN_THRESHOLD = 2;
 
+    private static final int RESEARCH_WINDOW_SECONDS = 120;
+
     // периоды MA для сбора значений/стороны/пересечений (на текущем тике)
     private static final int[] MA_PERIODS = {16, 20, 50};
 
@@ -29,6 +35,9 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
     private final double[] quotes = new double[LONG_WINDOW];
     private int size = 0;
     private int head = 0;
+
+    private final Deque<TickSample> researchTicks = new ArrayDeque<>();
+    private Instant researchStartedAt = null;
 
     private String lastQuoteText = null;
 
@@ -47,7 +56,7 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         switch (event.action()) {
             case RESET -> {
                 reset();
-                sink.onSnapshot(warmupSnapshot());
+                sink.onSnapshot(warmupSnapshot(event.receivedAt()));
                 return;
             }
             case STOP -> {
@@ -78,8 +87,9 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
         lastQuoteText = qText;
         appendQuote(q);
+        appendResearchTick(event.receivedAt(), q);
 
-        sink.onSnapshot(buildSnapshot());
+        sink.onSnapshot(buildSnapshot(event.receivedAt()));
     }
 
     private void reset() {
@@ -88,6 +98,7 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         head = 0;
         lastQuoteText = null;
         prevMaSign.clear();
+        clearResearchTicks();
 
         if (sink instanceof Resetable) {
             ((Resetable) sink).reset();
@@ -102,7 +113,39 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         }
     }
 
-    private TickStatsSnapshot warmupSnapshot() {
+    private synchronized void appendResearchTick(Instant at, double quote) {
+        if (researchStartedAt == null) {
+            researchStartedAt = at;
+        }
+
+        researchTicks.addLast(new TickSample(at, quote));
+
+        Instant cutoff = at.minusSeconds(RESEARCH_WINDOW_SECONDS);
+        while (!researchTicks.isEmpty() && researchTicks.peekFirst().at().isBefore(cutoff)) {
+            researchTicks.removeFirst();
+        }
+    }
+
+    private synchronized void clearResearchTicks() {
+        researchTicks.clear();
+        researchStartedAt = null;
+    }
+
+    public synchronized List<TickSample> snapshotResearchTicks() {
+        if (researchStartedAt == null || researchTicks.isEmpty()) {
+            return List.of();
+        }
+
+        Instant lastAt = researchTicks.peekLast().at();
+
+        if (lastAt.isBefore(researchStartedAt.plusSeconds(RESEARCH_WINDOW_SECONDS))) {
+            return List.of();
+        }
+
+        return List.copyOf(researchTicks);
+    }
+
+    private TickStatsSnapshot warmupSnapshot(Instant at) {
         return new TickStatsSnapshot(
                 symbol,
                 TickStatsState.WARMUP_S,
@@ -114,12 +157,12 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                 null, null,
                 0,
                 "RESET",
-                Instant.now(),
+                at,
                 Map.of()                 // movingAverages пусто на warmup
         );
     }
 
-    private TickStatsSnapshot buildSnapshot() {
+    private TickStatsSnapshot buildSnapshot(Instant at) {
         int bufLong = size;
         int bufShort = Math.min(size, SHORT_WINDOW);
 
@@ -167,7 +210,7 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                 lastQuoteString,
                 zeroShort,
                 reason,
-                Instant.now(),
+                at,
                 movingAverages
         );
     }

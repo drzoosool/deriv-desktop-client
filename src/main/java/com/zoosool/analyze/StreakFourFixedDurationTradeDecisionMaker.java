@@ -4,9 +4,10 @@ package com.zoosool.analyze;
 import com.zoosool.deriv.BalanceHolder;
 import com.zoosool.deriv.DerivTradingService;
 import com.zoosool.enums.TradeMode;
-import com.zoosool.model.AnalyzeContainer;
+import com.zoosool.logger.SnapTradeLogger;
 import com.zoosool.model.Contract;
 import com.zoosool.model.MaPoint;
+import com.zoosool.model.TickSample;
 import com.zoosool.model.TickStatsSnapshot;
 import com.zoosool.state.TradeWindowState;
 
@@ -15,12 +16,14 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDecisionMaker {
 
@@ -37,15 +40,11 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             BigDecimal.valueOf(3500),
     };
 
-    private static final int DIR_STREAK_REQUIRED = 4;
     private static final int CONTRACT_DURATION_SECONDS = 5;
-
-    private static final int TAPE_KEEP_SECONDS = 600;
-    private static final int MIN_HISTORY_SECONDS_BEFORE_TRADING = TAPE_KEEP_SECONDS;
-
     private static final String DEFAULT_DURATION_UNIT = "t";
 
-    private enum Direction { UP, DOWN, NONE }
+    // период MA, по пересечению которого стартует/переключается METRONOME
+    private static final int METRONOME_MA_PERIOD = 50;
 
     private volatile boolean tradingEnabled = false;
 
@@ -54,32 +53,24 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // -------------------------------------------------------------------------
 
     private final DerivTradingService trading;
+
     @SuppressWarnings("unused")
     private final BalanceHolder balanceHolder;
+
     private final Consumer<String> log;
     private final ZoneId zone = ZoneId.systemDefault();
 
-    // -------------------------------------------------------------------------
-    // Tape
-    // -------------------------------------------------------------------------
-
-    private final GlobalLevelTape tape = new GlobalLevelTape(TAPE_KEEP_SECONDS);
-    private final TradeHistoryRecorder recorder;
-
-    private long firstTapeEpochSecond = -1;
-    private boolean warmupStartLogged = false;
-    private boolean warmupEndLogged = false;
-
-    private long lastProcessedEpochSecond = -1;
-    private Long lastProcessedLevel = null;
+    private final SnapTradeLogger snapLogger;
+    private final TradeWindowState tradeWindowState;
 
     // -------------------------------------------------------------------------
-    // Signal state
+    // METRONOME state
     // -------------------------------------------------------------------------
 
-    private Direction direction = Direction.NONE;
-    private int directionStreak = 0;
-    private boolean armed = false;
+    // METRONOME: текущее направление, определённое последним пересечением MA50.
+    // null => пересечения ещё не было (или бот только что включён) => не торгуем.
+    // Читается/пишется только под synchronized(this).
+    private DerivTradingService.Direction metronomeDir = null;
 
     // -------------------------------------------------------------------------
     // Trading state
@@ -95,10 +86,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private boolean stopped = false;
     private String stopReason = null;
     private LocalDateTime stopAt = null;
-    private final TradeWindowState tradeWindowState;
-
-    // metronome: не даём слать больше одной ставки в секунду
-    private long lastMetronomeEpochSecond = -1;
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -109,15 +96,38 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             BalanceHolder balanceHolder,
             Consumer<String> logger,
             TradeWindowState tradeWindowState) {
+
         this.trading = Objects.requireNonNull(trading, "trading");
         this.balanceHolder = Objects.requireNonNull(balanceHolder, "balanceHolder");
         this.log = Objects.requireNonNull(logger, "logger");
-        this.recorder = new TradeHistoryRecorder(Path.of("trade-data"), s -> {});
-        this.tradeWindowState = tradeWindowState;
+        this.tradeWindowState = Objects.requireNonNull(tradeWindowState, "tradeWindowState");
+
+        this.snapLogger = new SnapTradeLogger(Path.of("snap-trades"), logger);
 
         this.tradingEnabled = tradeWindowState.isAutoTradeEnabled();
+
         tradeWindowState.autoTradeEnabledProperty().addListener((obs, oldV, newV) -> {
             this.tradingEnabled = newV;
+
+            if (newV) {
+                synchronized (this) {
+                    metronomeDir = null;
+                }
+
+                TradeMode m = tradeWindowState.getTradeMode();
+                var sel = tradeWindowState.getSelectedAsset();
+
+                logger.accept("SnapTradeLogger DIAG: enable=true mode=" + m
+                        + " selected=" + (sel == null ? "null" : sel.symbol()));
+
+                if (m == TradeMode.SNAP) {
+                    snapLogger.start(sel == null ? "unknown" : sel.symbol());
+                } else {
+                    logger.accept("SnapTradeLogger DIAG: start() ПРОПУЩЕН, режим не SNAP");
+                }
+            } else {
+                snapLogger.stop();
+            }
         });
     }
 
@@ -126,10 +136,15 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // -------------------------------------------------------------------------
 
     @Override
-    public void decideAndTradeSnap(String symbol, TickStatsSnapshot snapshot) {
-        if (!tradingEnabled) {          // было: !tradeWindowState.isAutoTradeEnabled()
+    public void decideAndTradeSnap(
+            String symbol,
+            TickStatsSnapshot snapshot,
+            Supplier<List<TickSample>> researchTicksSupplier) {
+
+        if (!tradingEnabled) {
             return;
         }
+
         if (snapshot == null) {
             return;
         }
@@ -138,17 +153,22 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         if (mode == null) return;
 
         switch (mode) {
-            case SNAP -> handleSnap(symbol, snapshot);
-            case METRONOME -> fireMetronomeTick(symbol);
+            case SNAP -> handleSnap(symbol, snapshot, researchTicksSupplier);
+            case METRONOME -> handleMetronome(symbol, snapshot);
         }
     }
 
     // -------------------------------------------------------------------------
-    // SNAP strategy (бывшая логика decideAndTradeSnap)
+    // SNAP strategy
     // -------------------------------------------------------------------------
 
-    private void handleSnap(String symbol, TickStatsSnapshot snapshot) {
+    private void handleSnap(
+            String symbol,
+            TickStatsSnapshot snapshot,
+            Supplier<List<TickSample>> researchTicksSupplier) {
+
         Integer xmaShort = snapshot.xmaShort();
+
         Map<Integer, MaPoint> mas = snapshot.movingAverages();
         MaPoint ma16 = (mas == null) ? null : mas.get(16);
         Integer maSide = (ma16 == null) ? null : ma16.side();
@@ -157,12 +177,21 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         if (xmaShort != 0) return;
         if (maSide == 0) return;
 
-        DerivTradingService.Direction dir =
-                (maSide > 0) ? DerivTradingService.Direction.DOWN
+        DerivTradingService.Direction signalDirection =
+                (maSide > 0)
+                        ? DerivTradingService.Direction.DOWN
                         : DerivTradingService.Direction.UP;
 
-        LocalDateTime ldt = LocalDateTime.now(zone);
-        long nowEpochSecond = Instant.now().getEpochSecond();
+        // Пока DefaultTickStatsCalculator не накопил полное research-окно,
+        // snapshotResearchTicks() возвращает пустой список.
+        //
+        // То есть до прогрева SNAP вообще не торгует.
+        List<TickSample> researchTicks = researchTicksSupplier.get();
+        if (researchTicks.isEmpty()) return;
+
+        Instant sentAt = Instant.now();
+        LocalDateTime ldt = LocalDateTime.ofInstant(sentAt, zone);
+        long nowEpochSecond = sentAt.getEpochSecond();
 
         TradePlan plan;
 
@@ -184,17 +213,32 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
             long tradeSeq = nextTradeSeq++;
 
-            inFlight = new InFlightTrade(tradeSeq, nowEpochSecond, symbol, stake.stakePerSide(), null);
+            inFlight = new InFlightTrade(
+                    tradeSeq,
+                    nowEpochSecond,
+                    symbol,
+                    stake.stakePerSide(),
+                    null
+            );
+
+            // Сейчас tradeDirection совпадает с signalDirection.
+            // Позже при INVERT signalDirection останется исходным,
+            // а tradeDirection будет фактически отправленным направлением.
+            DerivTradingService.Direction tradeDirection = signalDirection;
 
             plan = new TradePlan(
                     tradeSeq,
                     nowEpochSecond,
+                    sentAt,
                     ldt,
                     symbol,
                     snapshot.lastQuote() == null ? 0L : Math.round(snapshot.lastQuote()),
                     contract,
                     stake,
-                    (dir == DerivTradingService.Direction.UP) ? Direction.UP : Direction.DOWN
+                    signalDirection,
+                    tradeDirection,
+                    snapshot,
+                    researchTicks
             );
         }
 
@@ -204,39 +248,96 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 + " symbol=" + plan.symbol()
                 + " maSide=" + maSide
                 + " xmaShort=" + xmaShort
-                + " dir=" + dir
+                + " dir=" + plan.tradeDirection()
                 + " stakePerSide=" + plan.stake().stakePerSide()
                 + " ladderIdx=" + plan.stake().ladderIdxAtSend()
-                + " durationSec=" + CONTRACT_DURATION_SECONDS);
+                + " durationSec=" + CONTRACT_DURATION_SECONDS
+                + " researchTicks=" + plan.researchTicks().size());
 
-        CompletableFuture<DerivTradingService.BuySellResult> fut = trading.buyOneAndAwait(plan.contract(), dir);
+        CompletableFuture<DerivTradingService.BuySellResult> fut =
+                trading.buyOneAndAwait(
+                        plan.contract(),
+                        plan.tradeDirection()
+                );
+
         wireInFlightFuture(plan, fut);
     }
 
     // -------------------------------------------------------------------------
-    // METRONOME strategy — одна ставка на каждый тик выбранного символа,
+    // METRONOME strategy
+    //
+    // Не реагирует на кнопку направления и не стартует при включении.
+    // Направление задаётся ПЕРЕСЕЧЕНИЕМ MA50:
+    //   cross > 0 (цена пробила MA50 снизу вверх)  -> UP
+    //   cross < 0 (сверху вниз)                    -> DOWN
+    // Между пересечениями направление держится, ставка шлётся на каждый тик.
+    // Обратное пересечение переключает направление на лету.
     // fire-and-forget: результат не ждём, in-flight/лестницу не трогаем.
     // -------------------------------------------------------------------------
 
-    private void fireMetronomeTick(String symbol) {
+    private void handleMetronome(String symbol, TickStatsSnapshot snapshot) {
         // символ должен совпадать с выбранным в окне
         var selected = tradeWindowState.getSelectedAsset();
+
         if (selected == null || !selected.symbol().equals(symbol)) {
             return;
         }
 
-        // ранний выход по флагу
         if (!tradingEnabled) {
             return;
         }
 
-        DerivTradingService.Direction dir = tradeWindowState.getDirection();
-        if (dir == null) {
+        // сторона пересечения MA50 на текущем тике (если ключ есть и MA прогрета)
+        Map<Integer, MaPoint> mas = snapshot.movingAverages();
+        MaPoint ma50 = (mas == null) ? null : mas.get(METRONOME_MA_PERIOD);
+
+        DerivTradingService.Direction dirToFire;
+        DerivTradingService.Direction dirBefore;
+        boolean changed;
+
+        synchronized (this) {
+            dirBefore = metronomeDir;
+
+            if (ma50 != null) {
+                int cross = ma50.cross();
+
+                if (cross > 0) {
+                    metronomeDir = DerivTradingService.Direction.UP;
+                } else if (cross < 0) {
+                    metronomeDir = DerivTradingService.Direction.DOWN;
+                }
+
+                // cross == 0 -> направление не трогаем (держим прежнее)
+            }
+
+            dirToFire = metronomeDir;
+            changed = (dirBefore != dirToFire);
+        }
+
+        if (changed) {
+            if (dirBefore == null) {
+                log.accept("🟫 METRONOME_START"
+                        + " time=" + LocalDateTime.now(zone)
+                        + " symbol=" + symbol
+                        + " dir=" + dirToFire
+                        + " maPeriod=" + METRONOME_MA_PERIOD);
+            } else {
+                log.accept("🟫 METRONOME_FLIP"
+                        + " time=" + LocalDateTime.now(zone)
+                        + " symbol=" + symbol
+                        + " dir=" + dirBefore + "->" + dirToFire
+                        + " maPeriod=" + METRONOME_MA_PERIOD);
+            }
+        }
+
+        // пересечения ещё не было — ждём, не торгуем
+        if (dirToFire == null) {
             return;
         }
 
         // stake из стейта, парсим на каждом тике; пусто/кривое -> пропуск
         BigDecimal stake = parseStakeQuiet(tradeWindowState.getStake());
+
         if (stake == null) {
             return;
         }
@@ -244,8 +345,8 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         Contract contract = new Contract(
                 symbol,
                 stake,
-                1,                              // duration: 1 тик
-                DEFAULT_DURATION_UNIT,          // "t"
+                1,
+                DEFAULT_DURATION_UNIT,
                 tradeWindowState.getBasis(),
                 tradeWindowState.isAllowEquals()
         );
@@ -255,7 +356,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             return;
         }
 
-        if (dir == DerivTradingService.Direction.UP) {
+        if (dirToFire == DerivTradingService.Direction.UP) {
             trading.buyRise(contract);
         } else {
             trading.buyFall(contract);
@@ -264,6 +365,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
     private static BigDecimal parseStakeQuiet(String raw) {
         if (raw == null || raw.isBlank()) return null;
+
         try {
             BigDecimal v = new BigDecimal(raw.trim());
             return (v.signum() > 0) ? v : null;
@@ -273,119 +375,24 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     }
 
     // -------------------------------------------------------------------------
-    // STREAK (disabled)
-    // -------------------------------------------------------------------------
-
-    @Override
-    public void decideAndTrade(String symbol, AnalyzeContainer analyze) {
-        if (true) {
-            return;
-        }
-        if (!tradeWindowState.isAutoTradeEnabled()) {
-            return;
-        }
-
-        if (!tradeWindowState.getSelectedAsset().symbol().equals(symbol)) {
-            return;
-        }
-
-        Long level = extractLastLevel(analyze);
-        if (level == null) {
-            return;
-        }
-
-        Instant now = Instant.now();
-        long nowEpochSecond = now.getEpochSecond();
-        LocalDateTime ldt = LocalDateTime.ofInstant(now, zone);
-
-        TradePlan plan = null;
-
-        synchronized (this) {
-            if (firstTapeEpochSecond < 0) {
-                firstTapeEpochSecond = nowEpochSecond;
-            }
-
-            tape.put(nowEpochSecond, level);
-
-            if (nowEpochSecond == lastProcessedEpochSecond) {
-                return;
-            }
-
-            if (lastProcessedEpochSecond >= 0 && (nowEpochSecond - lastProcessedEpochSecond) > 1) {
-                resetStreakLocked();
-                lastProcessedLevel = null;
-            }
-
-            updateDirectionAndStreakLocked(level);
-
-            if (directionStreak >= DIR_STREAK_REQUIRED) {
-                armed = true;
-            }
-
-            boolean warmedUp = isWarmedUpLocked(nowEpochSecond);
-            maybeLogWarmupStateLocked(ldt, nowEpochSecond, warmedUp);
-
-            if (!stopped && armed && inFlight == null) {
-
-                StakeSnapshot stake = snapshotStakeLocked();
-
-                Contract contract = new Contract(
-                        symbol,
-                        stake.stakePerSide(),
-                        CONTRACT_DURATION_SECONDS,
-                        DEFAULT_DURATION_UNIT,
-                        tradeWindowState.getBasis(),
-                        false
-                );
-
-                long tradeSeq = nextTradeSeq++;
-
-                inFlight = new InFlightTrade(tradeSeq, nowEpochSecond, symbol, stake.stakePerSide(), null);
-                armed = false;
-
-                plan = new TradePlan(
-                        tradeSeq,
-                        nowEpochSecond,
-                        ldt,
-                        symbol,
-                        level,
-                        contract,
-                        stake,
-                        direction
-                );
-            }
-
-            lastProcessedEpochSecond = nowEpochSecond;
-            lastProcessedLevel = level;
-        }
-
-        if (plan != null) {
-            log.accept("🟦 RULE_TRADE"
-                    + " time=" + plan.ldt()
-                    + " tradeSeq=" + plan.tradeSeq()
-                    + " epochSecond=" + plan.epochSecond()
-                    + " symbol=" + plan.symbol()
-                    + " level=" + plan.level()
-                    + " dir=" + plan.signalDirection()
-                    + " streak=" + DIR_STREAK_REQUIRED
-                    + " stakePerSide=" + plan.stake().stakePerSide()
-                    + " ladderIdx=" + plan.stake().ladderIdxAtSend()
-                    + " durationSec=" + CONTRACT_DURATION_SECONDS);
-
-            CompletableFuture<DerivTradingService.BuySellResult> fut = trading.buySellAndAwait(plan.contract());
-            wireInFlightFuture(plan, fut);
-        }
-    }
-
-    // -------------------------------------------------------------------------
     // Async wiring
     // -------------------------------------------------------------------------
 
-    private void wireInFlightFuture(TradePlan plan, CompletableFuture<DerivTradingService.BuySellResult> fut) {
+    private void wireInFlightFuture(
+            TradePlan plan,
+            CompletableFuture<DerivTradingService.BuySellResult> fut) {
+
         synchronized (this) {
             InFlightTrade cur = inFlight;
+
             if (cur != null && cur.tradeSeq() == plan.tradeSeq()) {
-                inFlight = new InFlightTrade(cur.tradeSeq(), cur.epochSecond(), cur.symbol(), cur.stakePerSide(), fut);
+                inFlight = new InFlightTrade(
+                        cur.tradeSeq(),
+                        cur.epochSecond(),
+                        cur.symbol(),
+                        cur.stakePerSide(),
+                        fut
+                );
             }
         }
 
@@ -395,6 +402,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             } finally {
                 synchronized (this) {
                     InFlightTrade cur = inFlight;
+
                     if (cur != null && cur.tradeSeq() == plan.tradeSeq()) {
                         inFlight = null;
                     }
@@ -403,19 +411,24 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         });
     }
 
-    private void applyResult(TradePlan plan, DerivTradingService.BuySellResult res, Throwable ex) {
-        long resultEpoch = Instant.now().getEpochSecond();
-        LocalDateTime ldt = LocalDateTime.now(zone);
+    private void applyResult(
+            TradePlan plan,
+            DerivTradingService.BuySellResult res,
+            Throwable ex) {
+
+        Instant resultAt = Instant.now();
+        LocalDateTime ldt = LocalDateTime.ofInstant(resultAt, zone);
 
         Throwable rootEx = (ex == null) ? null : unwrapCompletion(ex);
         String exText = (rootEx == null) ? "" : (" ex=" + rootEx);
 
-        boolean success = (rootEx == null && res == DerivTradingService.BuySellResult.SUCCESS);
+        boolean success =
+                rootEx == null
+                        && res == DerivTradingService.BuySellResult.SUCCESS;
 
         int prevIdx;
         int newIdx;
         boolean failOnLastStep;
-        String timelineRle;
 
         synchronized (this) {
             if (plan.tradeSeq() <= lastSettledTradeSeq) {
@@ -428,6 +441,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                         + exText);
                 return;
             }
+
             lastSettledTradeSeq = plan.tradeSeq();
 
             if (stopped) {
@@ -443,44 +457,49 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             }
 
             prevIdx = ladderIdx;
-            failOnLastStep = (!success) && (prevIdx == LADDER.length - 1);
+
+            failOnLastStep =
+                    !success
+                            && prevIdx == LADDER.length - 1;
 
             if (success) {
                 ladderIdx = 0;
             } else {
-                ladderIdx = Math.min(ladderIdx + 1, LADDER.length - 1);
+                ladderIdx = Math.min(
+                        ladderIdx + 1,
+                        LADDER.length - 1
+                );
             }
 
             newIdx = ladderIdx;
 
             if (failOnLastStep) {
                 stopped = true;
-                stopReason = (rootEx != null ? "LAST_STEP_ERROR->FAIL" : "LAST_STEP_FAIL");
+                stopReason =
+                        rootEx != null
+                                ? "LAST_STEP_ERROR->FAIL"
+                                : "LAST_STEP_FAIL";
                 stopAt = ldt;
             }
-
-            timelineRle = tape.snapshotLastRleJsonWithTimestamps(resultEpoch);
         }
 
-        recorder.recordTradeClosed(
-                resultEpoch,
-                plan.symbol(),
+        // Единственный SNAP-лог.
+        // Здесь лежит и старая история сделки, и snapshot, и researchTicks.
+        snapLogger.log(new SnapTradeLogger.Entry(
                 plan.tradeSeq(),
-                plan.epochSecond(),
-                plan.durationSeconds(),
-                tradeWindowState.getBasis(),
-                plan.stake().stakePerSide().toPlainString(),
-                plan.stake().ladderIdxAtSend(),
-                prevIdx,
-                newIdx,
-                LADDER[newIdx].toPlainString(),
+                ldt.toString(),
+                plan.signalSnapshot().at().toString(),
+                plan.sentAt().toString(),
+                plan.symbol(),
+                plan.signalDirection().name(),
+                plan.tradeDirection().name(),
+                plan.stake().stakePerSide(),
                 success ? "SUCCESS" : "FAIL",
-                (rootEx == null ? null : rootEx.toString()),
-                -1L,
-                resultEpoch,
-                TAPE_KEEP_SECONDS,
-                timelineRle
-        );
+                prevIdx,
+                rootEx == null ? null : rootEx.toString(),
+                plan.signalSnapshot(),
+                plan.researchTicks()
+        ));
 
         if (failOnLastStep) {
             log.accept("🟥 STOP_TRADING"
@@ -521,75 +540,30 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
     private static Throwable unwrapCompletion(Throwable ex) {
         Throwable t = ex;
-        while ((t instanceof CompletionException || t instanceof ExecutionException) && t.getCause() != null) {
+
+        while ((t instanceof CompletionException || t instanceof ExecutionException)
+                && t.getCause() != null) {
             t = t.getCause();
         }
+
         return t;
     }
 
-    private void resetStreakLocked() {
-        direction = Direction.NONE;
-        directionStreak = 0;
-        armed = false;
-    }
-
-    private boolean isWarmedUpLocked(long nowEpochSecond) {
-        if (firstTapeEpochSecond < 0) return false;
-        return (nowEpochSecond - firstTapeEpochSecond) >= (MIN_HISTORY_SECONDS_BEFORE_TRADING - 1L);
-    }
-
-    private void maybeLogWarmupStateLocked(LocalDateTime ldt, long nowEpochSecond, boolean warmedUp) {
-        if (!warmupStartLogged) {
-            warmupStartLogged = true;
-            log.accept("🟨 WARMUP_START time=" + ldt + " needSec=" + MIN_HISTORY_SECONDS_BEFORE_TRADING);
-        }
-        if (warmedUp && !warmupEndLogged) {
-            warmupEndLogged = true;
-            long age = nowEpochSecond - firstTapeEpochSecond;
-            log.accept("🟩 WARMUP_END time=" + ldt + " historySec=" + age + " tapeHorizonSec=" + TAPE_KEEP_SECONDS);
-        }
-    }
-
-    private void updateDirectionAndStreakLocked(Long currentLevel) {
-        if (lastProcessedLevel == null) {
-            resetStreakLocked();
-            return;
-        }
-
-        long diff = currentLevel - lastProcessedLevel;
-
-        if (diff == 0) {
-            resetStreakLocked();
-            return;
-        }
-
-        Direction newDir = diff > 0 ? Direction.UP : Direction.DOWN;
-
-        if (newDir == direction) {
-            directionStreak++;
-        } else {
-            direction = newDir;
-            directionStreak = 1;
-            armed = false;
-        }
-    }
-
     private StakeSnapshot snapshotStakeLocked() {
-        return new StakeSnapshot(ladderIdx, LADDER[ladderIdx]);
-    }
-
-    private static Long extractLastLevel(AnalyzeContainer analyze) {
-        if (analyze == null) return null;
-        AnalyzeContainer.LevelsEdgesSnapshot snap = analyze.snapshotLevelsEdges();
-        if (snap == null || snap.size() <= 0) return null;
-        return snap.last();
+        return new StakeSnapshot(
+                ladderIdx,
+                LADDER[ladderIdx]
+        );
     }
 
     // -------------------------------------------------------------------------
     // Value types
     // -------------------------------------------------------------------------
 
-    private record StakeSnapshot(int ladderIdxAtSend, BigDecimal stakePerSide) {}
+    private record StakeSnapshot(
+            int ladderIdxAtSend,
+            BigDecimal stakePerSide
+    ) {}
 
     private record InFlightTrade(
             long tradeSeq,
@@ -602,12 +576,16 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private record TradePlan(
             long tradeSeq,
             long epochSecond,
+            Instant sentAt,
             LocalDateTime ldt,
             String symbol,
             long level,
             Contract contract,
             StakeSnapshot stake,
-            Direction signalDirection
+            DerivTradingService.Direction signalDirection,
+            DerivTradingService.Direction tradeDirection,
+            TickStatsSnapshot signalSnapshot,
+            List<TickSample> researchTicks
     ) {
         int durationSeconds() {
             return CONTRACT_DURATION_SECONDS;

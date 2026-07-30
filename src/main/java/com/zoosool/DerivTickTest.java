@@ -23,8 +23,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class DerivTickTest {
 
     // ── КОНФИГ (для теста хардкод; потом в vault/env) ─────────────────
-    static final String APP_ID = "33TPtshmMkxSrdZoHQ8mt";          // из developers.deriv.com
-    static final String PAT     = "pat_92adc1c8feb022b1f51b083e0e644c985f6d5dad496beaa4eea9eba81b5d5bb2";          // Deriv → API token, scope trade
+    static final String APP_ID = "id";          // из developers.deriv.com
+    static final String PAT     = "pass";          // Deriv → API token, scope trade
     static final String REST_BASE = "https://api.derivws.com/trading/v1/options";
     static final String SYMBOL = "R_100";                // синтетика, торгуется 24/7
 

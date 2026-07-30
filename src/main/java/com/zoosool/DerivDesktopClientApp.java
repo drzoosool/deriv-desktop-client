@@ -71,7 +71,11 @@ public class DerivDesktopClientApp extends Application {
         FanOutTickStatsSink uiSink = new FanOutTickStatsSink(statsView, chartView);
 
         TickDecisionEngineSink tickDecisionEngineSink = new TickDecisionEngineSink(uiSink, noFilterTradeDecisionMaker);
-        TickStatsCalculatorFactory statsCalcFactory = symbol -> new DefaultTickStatsCalculator(symbol, tickDecisionEngineSink);
+        TickStatsCalculatorFactory statsCalcFactory = symbol -> {
+            DefaultTickStatsCalculator calculator = new DefaultTickStatsCalculator(symbol, tickDecisionEngineSink);
+            tickDecisionEngineSink.registerResearchTicks(symbol, calculator::snapshotResearchTicks);
+            return calculator;
+        };
 
         tickEventRouterService = new TickEventRouterService(
                 appLogView.logger(),
