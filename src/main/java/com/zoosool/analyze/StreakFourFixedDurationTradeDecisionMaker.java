@@ -43,9 +43,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private static final int CONTRACT_DURATION_SECONDS = 5;
     private static final String DEFAULT_DURATION_UNIT = "t";
 
-    // период MA, по пересечению которого стартует/переключается METRONOME
-    private static final int METRONOME_MA_PERIOD = 50;
-
     private volatile boolean tradingEnabled = false;
 
     // -------------------------------------------------------------------------
@@ -62,15 +59,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
     private final SnapTradeLogger snapLogger;
     private final TradeWindowState tradeWindowState;
-
-    // -------------------------------------------------------------------------
-    // METRONOME state
-    // -------------------------------------------------------------------------
-
-    // METRONOME: текущее направление, определённое последним пересечением MA50.
-    // null => пересечения ещё не было (или бот только что включён) => не торгуем.
-    // Читается/пишется только под synchronized(this).
-    private DerivTradingService.Direction metronomeDir = null;
 
     // -------------------------------------------------------------------------
     // Trading state
@@ -110,10 +98,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             this.tradingEnabled = newV;
 
             if (newV) {
-                synchronized (this) {
-                    metronomeDir = null;
-                }
-
                 TradeMode m = tradeWindowState.getTradeMode();
                 var sel = tradeWindowState.getSelectedAsset();
 
@@ -154,7 +138,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
         switch (mode) {
             case SNAP -> handleSnap(symbol, snapshot, researchTicksSupplier);
-            case METRONOME -> handleMetronome(symbol, snapshot);
+            case METRONOME -> fireMetronomeTick(symbol);
         }
     }
 
@@ -266,19 +250,15 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // -------------------------------------------------------------------------
     // METRONOME strategy
     //
-    // Не реагирует на кнопку направления и не стартует при включении.
-    // Направление задаётся ПЕРЕСЕЧЕНИЕМ MA50:
-    //   cross > 0 (цена пробила MA50 снизу вверх)  -> UP
-    //   cross < 0 (сверху вниз)                    -> DOWN
-    // Между пересечениями направление держится, ставка шлётся на каждый тик.
-    // Обратное пересечение переключает направление на лету.
-    // fire-and-forget: результат не ждём, in-flight/лестницу не трогаем.
+    // Направление — строго из кнопки (tradeWindowState.getDirection()).
+    // Никакого MA и анализа движения цены: на каждый тик выбранного символа
+    // шлём одну ставку в сторону кнопки. fire-and-forget: результат не ждём,
+    // in-flight/лестницу не трогаем.
     // -------------------------------------------------------------------------
 
-    private void handleMetronome(String symbol, TickStatsSnapshot snapshot) {
+    private void fireMetronomeTick(String symbol) {
         // символ должен совпадать с выбранным в окне
         var selected = tradeWindowState.getSelectedAsset();
-
         if (selected == null || !selected.symbol().equals(symbol)) {
             return;
         }
@@ -287,57 +267,13 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             return;
         }
 
-        // сторона пересечения MA50 на текущем тике (если ключ есть и MA прогрета)
-        Map<Integer, MaPoint> mas = snapshot.movingAverages();
-        MaPoint ma50 = (mas == null) ? null : mas.get(METRONOME_MA_PERIOD);
-
-        DerivTradingService.Direction dirToFire;
-        DerivTradingService.Direction dirBefore;
-        boolean changed;
-
-        synchronized (this) {
-            dirBefore = metronomeDir;
-
-            if (ma50 != null) {
-                int cross = ma50.cross();
-
-                if (cross > 0) {
-                    metronomeDir = DerivTradingService.Direction.UP;
-                } else if (cross < 0) {
-                    metronomeDir = DerivTradingService.Direction.DOWN;
-                }
-
-                // cross == 0 -> направление не трогаем (держим прежнее)
-            }
-
-            dirToFire = metronomeDir;
-            changed = (dirBefore != dirToFire);
-        }
-
-        if (changed) {
-            if (dirBefore == null) {
-                log.accept("🟫 METRONOME_START"
-                        + " time=" + LocalDateTime.now(zone)
-                        + " symbol=" + symbol
-                        + " dir=" + dirToFire
-                        + " maPeriod=" + METRONOME_MA_PERIOD);
-            } else {
-                log.accept("🟫 METRONOME_FLIP"
-                        + " time=" + LocalDateTime.now(zone)
-                        + " symbol=" + symbol
-                        + " dir=" + dirBefore + "->" + dirToFire
-                        + " maPeriod=" + METRONOME_MA_PERIOD);
-            }
-        }
-
-        // пересечения ещё не было — ждём, не торгуем
-        if (dirToFire == null) {
+        DerivTradingService.Direction dir = tradeWindowState.getDirection();
+        if (dir == null) {
             return;
         }
 
         // stake из стейта, парсим на каждом тике; пусто/кривое -> пропуск
         BigDecimal stake = parseStakeQuiet(tradeWindowState.getStake());
-
         if (stake == null) {
             return;
         }
@@ -345,8 +281,8 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         Contract contract = new Contract(
                 symbol,
                 stake,
-                1,
-                DEFAULT_DURATION_UNIT,
+                1,                              // duration: 1 тик
+                DEFAULT_DURATION_UNIT,          // "t"
                 tradeWindowState.getBasis(),
                 tradeWindowState.isAllowEquals()
         );
@@ -356,7 +292,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             return;
         }
 
-        if (dirToFire == DerivTradingService.Direction.UP) {
+        if (dir == DerivTradingService.Direction.UP) {
             trading.buyRise(contract);
         } else {
             trading.buyFall(contract);
