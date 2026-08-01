@@ -12,10 +12,13 @@ import com.zoosool.model.TickStatsSnapshot;
 import com.zoosool.state.TradeWindowState;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -27,20 +30,28 @@ import java.util.function.Supplier;
 
 public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDecisionMaker {
 
-    private static final BigDecimal[] LADDER = {
-            BigDecimal.valueOf(1),
-            BigDecimal.valueOf(2),
-            BigDecimal.valueOf(5),
-            BigDecimal.valueOf(15),
-            BigDecimal.valueOf(40),
-            BigDecimal.valueOf(100),
-            BigDecimal.valueOf(300),
-            BigDecimal.valueOf(800),
-            BigDecimal.valueOf(1600),
-            BigDecimal.valueOf(3500),
-    };
+    // -------------------------------------------------------------------------
+    // Money management
+    // -------------------------------------------------------------------------
+
+    private static final BigDecimal PAYOUT = BigDecimal.valueOf(0.976);
+    private static final BigDecimal DYNAMIC_TARGET_PROFIT = BigDecimal.valueOf(0.50);
+    private static final BigDecimal DYNAMIC_MAX_STAKE = BigDecimal.valueOf(10);
+
+    // -------------------------------------------------------------------------
+    // 7+ recovery
+    // -------------------------------------------------------------------------
+
+    private static final int RECOVERY_FAIL_STREAK = 7;
+    private static final int RECOVERY_TRADE_COUNT = 5;
+    private static final BigDecimal RECOVERY_FIXED_STAKE = BigDecimal.valueOf(100);
+
+    // -------------------------------------------------------------------------
+    // Contract
+    // -------------------------------------------------------------------------
 
     private static final int CONTRACT_DURATION_SECONDS = 5;
+    private static final int VIRTUAL_DURATION_TICKS = 5;
     private static final String DEFAULT_DURATION_UNIT = "t";
 
     private volatile boolean tradingEnabled = false;
@@ -58,11 +69,15 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private final ZoneId zone = ZoneId.systemDefault();
 
     private final SnapTradeLogger snapLogger;
+    private final SnapTradeLogger virtualSnapLogger;
+
     private final TradeWindowState tradeWindowState;
 
     // -------------------------------------------------------------------------
     // Trading state
     // -------------------------------------------------------------------------
+
+    private BigDecimal cyclePnL = BigDecimal.ZERO;
 
     private int ladderIdx = 0;
 
@@ -70,6 +85,54 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private long lastSettledTradeSeq = 0;
 
     private InFlightTrade inFlight = null;
+
+    // -------------------------------------------------------------------------
+    // Virtual contracts
+    //
+    // Каждый принятый SNAP обязательно получает virtual contract.
+    //
+    // Пока virtual contract существует, следующий SNAP не принимается.
+    //
+    // Map используется намеренно, чтобы уже созданный virtual contract
+    // невозможно было случайно перезаписать новым.
+    // -------------------------------------------------------------------------
+
+    private final Map<Long, VirtualTrade> virtualTrades = new HashMap<>();
+
+    // Для сравнения REAL и VIRTUAL.
+    //
+    // Результаты могут прийти в любом порядке.
+    // Удаляем их только после того, как получили обе стороны.
+    private final Map<Long, Boolean> realResults = new HashMap<>();
+    private final Map<Long, Boolean> virtualResults = new HashMap<>();
+
+    // -------------------------------------------------------------------------
+    // MA16-SKIP
+    // -------------------------------------------------------------------------
+
+    private final Map<String, Instant> blockedAfterFailBySymbol = new HashMap<>();
+
+    // -------------------------------------------------------------------------
+    // RAW statistics / 7+
+    //
+    // Считается только по VIRTUAL результатам.
+    //
+    // Поэтому обычный MA16-SKIP не меняет RAW-последовательность:
+    // skipped signal всё равно получает виртуальный SUCCESS / FAIL.
+    // -------------------------------------------------------------------------
+
+    private int rawFailStreak = 0;
+    private boolean recoveryWaitingSuccess = false;
+
+    // Сколько следующих ПРИНЯТЫХ RAW-сигналов реально торгуем fixed 100.
+    private int recoveryTradesRemaining = 0;
+
+    // -------------------------------------------------------------------------
+    // Stop state
+    //
+    // По длине лестницы больше не останавливаемся.
+    // Поля оставляем под настоящий hard stop.
+    // -------------------------------------------------------------------------
 
     private boolean stopped = false;
     private String stopReason = null;
@@ -91,6 +154,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         this.tradeWindowState = Objects.requireNonNull(tradeWindowState, "tradeWindowState");
 
         this.snapLogger = new SnapTradeLogger(Path.of("snap-trades"), logger);
+        this.virtualSnapLogger = new SnapTradeLogger(Path.of("snap-virtual-trades"), logger);
 
         this.tradingEnabled = tradeWindowState.isAutoTradeEnabled();
 
@@ -105,12 +169,18 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                         + " selected=" + (sel == null ? "null" : sel.symbol()));
 
                 if (m == TradeMode.SNAP) {
-                    snapLogger.start(sel == null ? "unknown" : sel.symbol());
+                    String symbol = sel == null ? "unknown" : sel.symbol();
+                    snapLogger.start(symbol);
+                    virtualSnapLogger.start(symbol);
                 } else {
                     logger.accept("SnapTradeLogger DIAG: start() ПРОПУЩЕН, режим не SNAP");
                 }
             } else {
                 snapLogger.stop();
+                // virtualSnapLogger специально НЕ останавливаем здесь.
+                //
+                // Уже открытая виртуальная сделка обязана получить
+                // результат даже после выключения AutoTrade.
             }
         });
     }
@@ -125,19 +195,27 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             TickStatsSnapshot snapshot,
             Supplier<List<TickSample>> researchTicksSupplier) {
 
-        if (!tradingEnabled) {
-            return;
-        }
+        if (snapshot == null) return;
 
-        if (snapshot == null) {
-            return;
-        }
+        // ---------------------------------------------------------------------
+        // ВАЖНО
+        //
+        // Virtual contracts обслуживаются ДО любых проверок tradingEnabled,
+        // stopped, TradeMode и т.д.
+        //
+        // Если виртуальная сделка уже создана, её результат обязан быть
+        // досчитан.
+        // ---------------------------------------------------------------------
+
+        processVirtualTrades(symbol, snapshot);
+
+        if (!tradingEnabled) return;
 
         TradeMode mode = tradeWindowState.getTradeMode();
         if (mode == null) return;
 
         switch (mode) {
-            case SNAP -> handleSnap(symbol, snapshot, researchTicksSupplier);
+            case SNAP -> handleSnapManaged(symbol, snapshot, researchTicksSupplier);
             case METRONOME -> fireMetronomeTick(symbol);
         }
     }
@@ -146,7 +224,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // SNAP strategy
     // -------------------------------------------------------------------------
 
-    private void handleSnap(
+    private void handleSnapManaged(
             String symbol,
             TickStatsSnapshot snapshot,
             Supplier<List<TickSample>> researchTicksSupplier) {
@@ -162,8 +240,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         if (maSide == 0) return;
 
         DerivTradingService.Direction signalDirection =
-                (maSide > 0)
-                        ? DerivTradingService.Direction.DOWN
+                (maSide > 0) ? DerivTradingService.Direction.DOWN
                         : DerivTradingService.Direction.UP;
 
         // Пока DefaultTickStatsCalculator не накопил полное research-окно,
@@ -177,53 +254,90 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         LocalDateTime ldt = LocalDateTime.ofInstant(sentAt, zone);
         long nowEpochSecond = sentAt.getEpochSecond();
 
-        TradePlan plan;
+        TradePlan plan = null;
+
+        boolean skip;
+        boolean recoveryTrade;
+        long tradeSeq;
+        StakeSnapshot stake;
 
         synchronized (this) {
-            if (stopped || inFlight != null) {
+
+            // -------------------------------------------------------------
+            // ОДИН ГЛОБАЛЬНЫЙ SLOT
+            //
+            // Кто первый пришёл, тот и играет.
+            //
+            // Slot занят пока существует:
+            // - REAL inFlight
+            // ИЛИ
+            // - хоть один незавершённый virtual contract.
+            //
+            // Поэтому REAL может завершиться раньше virtual и наоборот —
+            // новый сигнал всё равно не войдёт.
+            // -------------------------------------------------------------
+
+            if (isSnapBusyLocked()) return;
+            if (stopped) return;
+
+            recoveryTrade = recoveryTradesRemaining > 0;
+
+            skip = !recoveryTrade && shouldSkipLocked(symbol, snapshot, researchTicks);
+
+            tradeSeq = nextTradeSeq++;
+
+            // Для SKIP фиксируем ту ставку, которая была бы сделана
+            // обычной стратегией.
+            //
+            // На cyclePnL она не влияет.
+            stake = recoveryTrade ? snapshotRecoveryStakeLocked() : snapshotDynamicStakeLocked();
+
+            // -------------------------------------------------------------
+            // EVERY ACCEPTED SNAP -> VIRTUAL
+            //
+            // Он создаётся ДО отправки REAL.
+            // После этого его нельзя потерять.
+            // -------------------------------------------------------------
+
+            virtualTrades.put(tradeSeq, new VirtualTrade(
+                    tradeSeq, symbol, signalDirection, sentAt, snapshot, researchTicks,
+                    stake.stakePerSide(), skip, recoveryTrade, false, 0.0, 0));
+
+            if (skip) {
+                log.accept("🟨 SNAP_SKIP"
+                        + " time=" + ldt
+                        + " tradeSeq=" + tradeSeq
+                        + " symbol=" + symbol
+                        + " dir=" + signalDirection
+                        + " virtualStake=" + stake.stakePerSide()
+                        + " reason=WAIT_MA16_CROSS"
+                        + " signalAt=" + snapshot.at()
+                        + " rawFailStreak=" + rawFailStreak
+                        + " recoveryWaitingSuccess=" + recoveryWaitingSuccess
+                        + " recoveryTradesRemaining=" + recoveryTradesRemaining);
                 return;
             }
 
-            StakeSnapshot stake = snapshotStakeLocked();
+            if (recoveryTrade) {
+                // Считаем именно количество следующих ПРИНЯТЫХ сигналов.
+                //
+                // Сделка сейчас уже принята, поэтому уменьшаем счётчик.
+                recoveryTradesRemaining = Math.max(0, recoveryTradesRemaining - 1);
+            }
 
             Contract contract = new Contract(
-                    symbol,
-                    stake.stakePerSide(),
-                    CONTRACT_DURATION_SECONDS,
-                    DEFAULT_DURATION_UNIT,
-                    tradeWindowState.getBasis(),
-                    false
-            );
+                    symbol, stake.stakePerSide(), CONTRACT_DURATION_SECONDS,
+                    DEFAULT_DURATION_UNIT, tradeWindowState.getBasis(), false);
 
-            long tradeSeq = nextTradeSeq++;
+            inFlight = new InFlightTrade(tradeSeq, nowEpochSecond, symbol, stake.stakePerSide(), null);
 
-            inFlight = new InFlightTrade(
-                    tradeSeq,
-                    nowEpochSecond,
-                    symbol,
-                    stake.stakePerSide(),
-                    null
-            );
-
-            // Сейчас tradeDirection совпадает с signalDirection.
-            // Позже при INVERT signalDirection останется исходным,
-            // а tradeDirection будет фактически отправленным направлением.
             DerivTradingService.Direction tradeDirection = signalDirection;
 
             plan = new TradePlan(
-                    tradeSeq,
-                    nowEpochSecond,
-                    sentAt,
-                    ldt,
-                    symbol,
+                    tradeSeq, nowEpochSecond, sentAt, ldt, symbol,
                     snapshot.lastQuote() == null ? 0L : Math.round(snapshot.lastQuote()),
-                    contract,
-                    stake,
-                    signalDirection,
-                    tradeDirection,
-                    snapshot,
-                    researchTicks
-            );
+                    contract, stake, signalDirection, tradeDirection,
+                    snapshot, researchTicks, recoveryTrade);
         }
 
         log.accept("🟪 SNAP_TRADE"
@@ -235,16 +349,320 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 + " dir=" + plan.tradeDirection()
                 + " stakePerSide=" + plan.stake().stakePerSide()
                 + " ladderIdx=" + plan.stake().ladderIdxAtSend()
+                + " recovery=" + plan.recoveryTrade()
+                + " cyclePnL=" + cyclePnL
+                + " rawFailStreak=" + rawFailStreak
+                + " recoveryTradesRemaining=" + recoveryTradesRemaining
                 + " durationSec=" + CONTRACT_DURATION_SECONDS
                 + " researchTicks=" + plan.researchTicks().size());
 
         CompletableFuture<DerivTradingService.BuySellResult> fut =
-                trading.buyOneAndAwait(
-                        plan.contract(),
-                        plan.tradeDirection()
-                );
+                trading.buyOneAndAwait(plan.contract(), plan.tradeDirection());
 
         wireInFlightFuture(plan, fut);
+    }
+
+    // -------------------------------------------------------------------------
+    // SNAP serialization
+    // -------------------------------------------------------------------------
+
+    private boolean isSnapBusyLocked() {
+        return inFlight != null || !virtualTrades.isEmpty();
+    }
+
+    // -------------------------------------------------------------------------
+    // MA16-SKIP
+    // -------------------------------------------------------------------------
+
+    private boolean shouldSkipLocked(
+            String symbol,
+            TickStatsSnapshot snapshot,
+            List<TickSample> researchTicks) {
+
+        Instant blockedAfter = blockedAfterFailBySymbol.get(symbol);
+        if (blockedAfter == null) return false;
+
+        boolean crossed = hasMa16CrossAfter(researchTicks, blockedAfter);
+        if (!crossed) return true;
+
+        blockedAfterFailBySymbol.remove(symbol);
+
+        log.accept("🟩 SNAP_UNBLOCK"
+                + " symbol=" + symbol
+                + " blockedAfter=" + blockedAfter
+                + " signalAt=" + snapshot.at());
+
+        return false;
+    }
+
+    private boolean hasMa16CrossAfter(List<TickSample> ticks, Instant after) {
+        if (ticks == null || ticks.size() < 17) return false;
+
+        Integer previousSide = null;
+
+        for (int i = 15; i < ticks.size(); i++) {
+            TickSample current = ticks.get(i);
+
+            double sum = 0.0;
+            for (int j = i - 15; j <= i; j++) {
+                sum += ticks.get(j).quote();
+            }
+            double ma = sum / 16.0;
+
+            int side = Double.compare(current.quote() - ma, 0.0);
+            if (side == 0) continue;
+
+            if (previousSide != null && side != previousSide && current.at().isAfter(after)) {
+                return true;
+            }
+
+            previousSide = side;
+        }
+
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Virtual contracts
+    //
+    // signal T0
+    // next tick of SAME symbol = OPEN
+    // then wait another 5 ticks of SAME symbol
+    // tick #5 after OPEN = CLOSE
+    // -------------------------------------------------------------------------
+
+    private void processVirtualTrades(String symbol, TickStatsSnapshot snapshot) {
+        Double quote = snapshot.lastQuote();
+        if (quote == null) return;
+
+        List<VirtualSettlement> settlements = new ArrayList<>();
+
+        synchronized (this) {
+            List<Long> ids = new ArrayList<>(virtualTrades.keySet());
+
+            for (Long tradeSeq : ids) {
+                VirtualTrade trade = virtualTrades.get(tradeSeq);
+                if (trade == null) continue;
+                if (!trade.symbol().equals(symbol)) continue;
+
+                VirtualProgress progress = processVirtualTradeTickLocked(trade, quote, snapshot.at());
+
+                if (progress.trade() != null) {
+                    virtualTrades.put(tradeSeq, progress.trade());
+                } else {
+                    virtualTrades.remove(tradeSeq);
+                }
+
+                if (progress.settlement() != null) {
+                    settlements.add(progress.settlement());
+                }
+            }
+        }
+
+        for (VirtualSettlement settlement : settlements) {
+            settleVirtualTrade(settlement);
+        }
+    }
+
+    private VirtualProgress processVirtualTradeTickLocked(
+            VirtualTrade trade, double quote, Instant tickAt) {
+
+        // -------------------------------------------------------------
+        // Первый тик ПОСЛЕ signal = OPEN.
+        //
+        // Сам signal tick сюда попасть не может:
+        // processVirtualTrades() вызывается до создания VirtualTrade.
+        // -------------------------------------------------------------
+
+        if (!trade.opened()) {
+            VirtualTrade opened = new VirtualTrade(
+                    trade.tradeSeq(), trade.symbol(), trade.direction(), trade.signalAt(),
+                    trade.signalSnapshot(), trade.researchTicks(), trade.stake(),
+                    trade.skip(), trade.recoveryTrade(), true, quote, 0);
+
+            log.accept("🟦 VIRTUAL_OPEN"
+                    + " tradeSeq=" + trade.tradeSeq()
+                    + " symbol=" + trade.symbol()
+                    + " skip=" + trade.skip()
+                    + " recovery=" + trade.recoveryTrade()
+                    + " dir=" + trade.direction()
+                    + " signalAt=" + trade.signalAt()
+                    + " openAt=" + tickAt
+                    + " openQuote=" + quote);
+
+            return new VirtualProgress(opened, null);
+        }
+
+        int ticksAfterOpen = trade.ticksAfterOpen() + 1;
+
+        if (ticksAfterOpen < VIRTUAL_DURATION_TICKS) {
+            VirtualTrade updated = new VirtualTrade(
+                    trade.tradeSeq(), trade.symbol(), trade.direction(), trade.signalAt(),
+                    trade.signalSnapshot(), trade.researchTicks(), trade.stake(),
+                    trade.skip(), trade.recoveryTrade(), true, trade.openQuote(), ticksAfterOpen);
+
+            return new VirtualProgress(updated, null);
+        }
+
+        boolean success = isVirtualSuccess(trade.direction(), trade.openQuote(), quote);
+
+        VirtualSettlement settlement = new VirtualSettlement(trade, tickAt, quote, success);
+
+        return new VirtualProgress(null, settlement);
+    }
+
+    private boolean isVirtualSuccess(
+            DerivTradingService.Direction direction, double openQuote, double closeQuote) {
+
+        if (direction == DerivTradingService.Direction.UP) {
+            return closeQuote > openQuote;
+        }
+        return closeQuote < openQuote;
+    }
+
+    private void settleVirtualTrade(VirtualSettlement settlement) {
+        VirtualTrade trade = settlement.trade();
+        boolean success = settlement.success();
+
+        LocalDateTime ldt = LocalDateTime.ofInstant(settlement.closeAt(), zone);
+
+        int prevRawFailStreak;
+        int newRawFailStreak;
+        boolean recoveryStarted;
+
+        synchronized (this) {
+            prevRawFailStreak = rawFailStreak;
+            recoveryStarted = registerRawSnapResultLocked(success);
+            newRawFailStreak = rawFailStreak;
+
+            virtualResults.put(trade.tradeSeq(), success);
+        }
+
+        // ---------------------------------------------------------------------
+        // Отдельный полный virtual log.
+        //
+        // SKIP здесь выглядит почти как обычная сделка,
+        // только error содержит VIRTUAL_SKIP.
+        // ---------------------------------------------------------------------
+
+        virtualSnapLogger.log(new SnapTradeLogger.Entry(
+                trade.tradeSeq(),
+                ldt.toString(),
+                trade.signalSnapshot().at().toString(),
+                trade.signalAt().toString(),
+                trade.symbol(),
+                trade.direction().name(),
+                trade.direction().name(),
+                trade.stake(),
+                success ? "SUCCESS" : "FAIL",
+                0,
+                trade.skip() ? "VIRTUAL_SKIP" : "VIRTUAL_REAL_MIRROR",
+                trade.signalSnapshot(),
+                trade.researchTicks()));
+
+        log.accept("🟦 VIRTUAL_RESULT"
+                + " time=" + ldt
+                + " tradeSeq=" + trade.tradeSeq()
+                + " symbol=" + trade.symbol()
+                + " skip=" + trade.skip()
+                + " recovery=" + trade.recoveryTrade()
+                + " dir=" + trade.direction()
+                + " openQuote=" + trade.openQuote()
+                + " closeQuote=" + settlement.closeQuote()
+                + " result=" + (success ? "SUCCESS" : "FAIL")
+                + " rawFailStreak " + prevRawFailStreak + "->" + newRawFailStreak
+                + " recoveryStarted=" + recoveryStarted
+                + " recoveryWaitingSuccess=" + recoveryWaitingSuccess
+                + " recoveryTradesRemaining=" + recoveryTradesRemaining);
+
+        if (!trade.skip()) {
+            logRealVirtualComparison(trade.tradeSeq());
+        }
+
+        cleanupResultState(trade.tradeSeq(), trade.skip());
+    }
+
+    // -------------------------------------------------------------------------
+    // RAW 7+
+    // -------------------------------------------------------------------------
+
+    private boolean registerRawSnapResultLocked(boolean success) {
+        if (!success) {
+            rawFailStreak++;
+
+            if (rawFailStreak >= RECOVERY_FAIL_STREAK) {
+                recoveryWaitingSuccess = true;
+            }
+
+            return false;
+        }
+
+        boolean recoveryStarted = false;
+
+        // Именно первый SUCCESS, завершивший 7+ RAW FAIL.
+        //
+        // Он сам НЕ входит в fixed100 window.
+        // Fixed100 начинается со следующего принятого RAW signal.
+        if (recoveryWaitingSuccess
+                && rawFailStreak >= RECOVERY_FAIL_STREAK
+                && recoveryTradesRemaining == 0) {
+
+            recoveryTradesRemaining = RECOVERY_TRADE_COUNT;
+            recoveryStarted = true;
+
+            log.accept("🟦 RAW_RECOVERY_START"
+                    + " failStreak=" + rawFailStreak
+                    + " fixedStake=" + RECOVERY_FIXED_STAKE
+                    + " trades=" + RECOVERY_TRADE_COUNT);
+        }
+
+        rawFailStreak = 0;
+        recoveryWaitingSuccess = false;
+
+        return recoveryStarted;
+    }
+
+    // -------------------------------------------------------------------------
+    // Dynamic ladder
+    //
+    // Пример:
+    //
+    // 1F -> 2F -> 4F -> 8F -> 10F -> 10 -> 10...
+    //
+    // После каждого результата выбирается минимальная целая ставка,
+    // которая при SUCCESS доведёт cyclePnL минимум до targetProfit.
+    //
+    // Сверху cap = 10.
+    //
+    // Никакого STOP по глубине.
+    // -------------------------------------------------------------------------
+
+    private StakeSnapshot snapshotDynamicStakeLocked() {
+        BigDecimal requiredProfit = DYNAMIC_TARGET_PROFIT.subtract(cyclePnL);
+
+        BigDecimal stake;
+
+        if (requiredProfit.signum() <= 0) {
+            stake = BigDecimal.ONE;
+        } else {
+            stake = requiredProfit.divide(PAYOUT, 0, RoundingMode.CEILING);
+
+            if (stake.compareTo(BigDecimal.ONE) < 0) stake = BigDecimal.ONE;
+            if (stake.compareTo(DYNAMIC_MAX_STAKE) > 0) stake = DYNAMIC_MAX_STAKE;
+        }
+
+        return new StakeSnapshot(ladderIdx, stake);
+    }
+
+    private StakeSnapshot snapshotRecoveryStakeLocked() {
+        return new StakeSnapshot(ladderIdx, RECOVERY_FIXED_STAKE);
+    }
+
+    private BigDecimal nextStakeForLog() {
+        synchronized (this) {
+            if (recoveryTradesRemaining > 0) return RECOVERY_FIXED_STAKE;
+            return snapshotDynamicStakeLocked().stakePerSide();
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -257,40 +675,22 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // -------------------------------------------------------------------------
 
     private void fireMetronomeTick(String symbol) {
-        // символ должен совпадать с выбранным в окне
         var selected = tradeWindowState.getSelectedAsset();
-        if (selected == null || !selected.symbol().equals(symbol)) {
-            return;
-        }
+        if (selected == null || !selected.symbol().equals(symbol)) return;
 
-        if (!tradingEnabled) {
-            return;
-        }
+        if (!tradingEnabled) return;
 
         DerivTradingService.Direction dir = tradeWindowState.getDirection();
-        if (dir == null) {
-            return;
-        }
+        if (dir == null) return;
 
-        // stake из стейта, парсим на каждом тике; пусто/кривое -> пропуск
         BigDecimal stake = parseStakeQuiet(tradeWindowState.getStake());
-        if (stake == null) {
-            return;
-        }
+        if (stake == null) return;
 
         Contract contract = new Contract(
-                symbol,
-                stake,
-                1,                              // duration: 1 тик
-                DEFAULT_DURATION_UNIT,          // "t"
-                tradeWindowState.getBasis(),
-                tradeWindowState.isAllowEquals()
-        );
+                symbol, stake, 1, DEFAULT_DURATION_UNIT,
+                tradeWindowState.getBasis(), tradeWindowState.isAllowEquals());
 
-        // последняя проверка перед самой отправкой — вдруг выключили, пока считали
-        if (!tradingEnabled) {
-            return;
-        }
+        if (!tradingEnabled) return;
 
         if (dir == DerivTradingService.Direction.UP) {
             trading.buyRise(contract);
@@ -304,7 +704,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
         try {
             BigDecimal v = new BigDecimal(raw.trim());
-            return (v.signum() > 0) ? v : null;
+            return v.signum() > 0 ? v : null;
         } catch (NumberFormatException ex) {
             return null;
         }
@@ -320,15 +720,9 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
         synchronized (this) {
             InFlightTrade cur = inFlight;
-
             if (cur != null && cur.tradeSeq() == plan.tradeSeq()) {
                 inFlight = new InFlightTrade(
-                        cur.tradeSeq(),
-                        cur.epochSecond(),
-                        cur.symbol(),
-                        cur.stakePerSide(),
-                        fut
-                );
+                        cur.tradeSeq(), cur.epochSecond(), cur.symbol(), cur.stakePerSide(), fut);
             }
         }
 
@@ -338,7 +732,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             } finally {
                 synchronized (this) {
                     InFlightTrade cur = inFlight;
-
                     if (cur != null && cur.tradeSeq() == plan.tradeSeq()) {
                         inFlight = null;
                     }
@@ -346,6 +739,10 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             }
         });
     }
+
+    // -------------------------------------------------------------------------
+    // REAL result
+    // -------------------------------------------------------------------------
 
     private void applyResult(
             TradePlan plan,
@@ -358,15 +755,16 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         Throwable rootEx = (ex == null) ? null : unwrapCompletion(ex);
         String exText = (rootEx == null) ? "" : (" ex=" + rootEx);
 
-        boolean success =
-                rootEx == null
-                        && res == DerivTradingService.BuySellResult.SUCCESS;
+        boolean success = rootEx == null && res == DerivTradingService.BuySellResult.SUCCESS;
 
         int prevIdx;
         int newIdx;
-        boolean failOnLastStep;
+
+        BigDecimal prevCyclePnL;
+        BigDecimal newCyclePnL;
 
         synchronized (this) {
+
             if (plan.tradeSeq() <= lastSettledTradeSeq) {
                 log.accept("🟧 RESULT_IGNORED_OUTDATED"
                         + " time=" + ldt
@@ -380,47 +778,59 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
             lastSettledTradeSeq = plan.tradeSeq();
 
-            if (stopped) {
-                log.accept("🟥 RESULT_IGNORED_STOPPED"
-                        + " time=" + ldt
-                        + " tradeSeq=" + plan.tradeSeq()
-                        + " symbol=" + plan.symbol()
-                        + " res=" + (res == null ? "null" : res)
-                        + exText
-                        + " stoppedAt=" + stopAt
-                        + " reason=" + stopReason);
-                return;
-            }
+            // Даже stopped не должен заставить забыть результат уже
+            // существующей сделки.
+            //
+            // stopped запрещает НОВЫЕ сделки.
+            // Уже отправленный REAL обязательно обрабатываем.
 
             prevIdx = ladderIdx;
+            prevCyclePnL = cyclePnL;
 
-            failOnLastStep =
-                    !success
-                            && prevIdx == LADDER.length - 1;
+            // -------------------------------------------------------------
+            // MA16 block
+            //
+            // Только обычная стратегия.
+            //
+            // Fixed100 recovery — отдельная стратегия и normal blocking
+            // не меняет.
+            // -------------------------------------------------------------
 
-            if (success) {
-                ladderIdx = 0;
-            } else {
-                ladderIdx = Math.min(
-                        ladderIdx + 1,
-                        LADDER.length - 1
-                );
+            if (!plan.recoveryTrade() && !success) {
+                blockedAfterFailBySymbol.put(plan.symbol(), plan.signalSnapshot().at());
+            }
+
+            // -------------------------------------------------------------
+            // Dynamic cycle PnL
+            //
+            // Recovery fixed100 не вмешивается в обычную лестницу.
+            // -------------------------------------------------------------
+
+            if (!plan.recoveryTrade()) {
+                BigDecimal delta = success
+                        ? plan.stake().stakePerSide().multiply(PAYOUT)
+                        : plan.stake().stakePerSide().negate();
+
+                cyclePnL = cyclePnL.add(delta);
+
+                if (cyclePnL.compareTo(DYNAMIC_TARGET_PROFIT) >= 0) {
+                    cyclePnL = BigDecimal.ZERO;
+                    ladderIdx = 0;
+                } else {
+                    ladderIdx++;
+                }
             }
 
             newIdx = ladderIdx;
+            newCyclePnL = cyclePnL;
 
-            if (failOnLastStep) {
-                stopped = true;
-                stopReason =
-                        rootEx != null
-                                ? "LAST_STEP_ERROR->FAIL"
-                                : "LAST_STEP_FAIL";
-                stopAt = ldt;
-            }
+            realResults.put(plan.tradeSeq(), success);
         }
 
-        // Единственный SNAP-лог.
-        // Здесь лежит и старая история сделки, и snapshot, и researchTicks.
+        // ---------------------------------------------------------------------
+        // REAL log
+        // ---------------------------------------------------------------------
+
         snapLogger.log(new SnapTradeLogger.Entry(
                 plan.tradeSeq(),
                 ldt.toString(),
@@ -434,20 +844,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 prevIdx,
                 rootEx == null ? null : rootEx.toString(),
                 plan.signalSnapshot(),
-                plan.researchTicks()
-        ));
-
-        if (failOnLastStep) {
-            log.accept("🟥 STOP_TRADING"
-                    + " time=" + ldt
-                    + " tradeSeq=" + plan.tradeSeq()
-                    + " symbol=" + plan.symbol()
-                    + " res=" + (res == null ? "null" : res.name())
-                    + exText
-                    + " ladder " + prevIdx + "->" + newIdx
-                    + " nextStake=" + LADDER[newIdx]);
-            return;
-        }
+                plan.researchTicks()));
 
         if (success) {
             log.accept("✅ RESULT"
@@ -456,8 +853,10 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                     + " symbol=" + plan.symbol()
                     + " res=SUCCESS"
                     + exText
+                    + " recovery=" + plan.recoveryTrade()
                     + " ladder " + prevIdx + "->" + newIdx
-                    + " nextStake=" + LADDER[newIdx]);
+                    + " cyclePnL " + prevCyclePnL + "->" + newCyclePnL
+                    + " nextStake=" + nextStakeForLog());
         } else {
             log.accept("❌ RESULT"
                     + " time=" + ldt
@@ -465,8 +864,47 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                     + " symbol=" + plan.symbol()
                     + " res=FAIL"
                     + exText
+                    + " recovery=" + plan.recoveryTrade()
                     + " ladder " + prevIdx + "->" + newIdx
-                    + " nextStake=" + LADDER[newIdx]);
+                    + " cyclePnL " + prevCyclePnL + "->" + newCyclePnL
+                    + " nextStake=" + nextStakeForLog());
+        }
+
+        logRealVirtualComparison(plan.tradeSeq());
+    }
+
+    // -------------------------------------------------------------------------
+    // REAL vs VIRTUAL
+    // -------------------------------------------------------------------------
+
+    private void logRealVirtualComparison(long tradeSeq) {
+        Boolean real;
+        Boolean virtual;
+
+        synchronized (this) {
+            real = realResults.get(tradeSeq);
+            virtual = virtualResults.get(tradeSeq);
+
+            if (real == null || virtual == null) return;
+
+            realResults.remove(tradeSeq);
+            virtualResults.remove(tradeSeq);
+        }
+
+        log.accept("🟦 REAL_VIRTUAL_COMPARE"
+                + " tradeSeq=" + tradeSeq
+                + " real=" + (real ? "SUCCESS" : "FAIL")
+                + " virtual=" + (virtual ? "SUCCESS" : "FAIL")
+                + " same=" + Objects.equals(real, virtual));
+    }
+
+    private void cleanupResultState(long tradeSeq, boolean skip) {
+        if (!skip) return;
+
+        synchronized (this) {
+            // У SKIP никогда не будет realResult,
+            // поэтому virtual result после логирования можно удалить.
+            virtualResults.remove(tradeSeq);
         }
     }
 
@@ -476,20 +914,11 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
     private static Throwable unwrapCompletion(Throwable ex) {
         Throwable t = ex;
-
         while ((t instanceof CompletionException || t instanceof ExecutionException)
                 && t.getCause() != null) {
             t = t.getCause();
         }
-
         return t;
-    }
-
-    private StakeSnapshot snapshotStakeLocked() {
-        return new StakeSnapshot(
-                ladderIdx,
-                LADDER[ladderIdx]
-        );
     }
 
     // -------------------------------------------------------------------------
@@ -521,10 +950,38 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             DerivTradingService.Direction signalDirection,
             DerivTradingService.Direction tradeDirection,
             TickStatsSnapshot signalSnapshot,
-            List<TickSample> researchTicks
+            List<TickSample> researchTicks,
+            boolean recoveryTrade
     ) {
         int durationSeconds() {
             return CONTRACT_DURATION_SECONDS;
         }
     }
+
+    private record VirtualTrade(
+            long tradeSeq,
+            String symbol,
+            DerivTradingService.Direction direction,
+            Instant signalAt,
+            TickStatsSnapshot signalSnapshot,
+            List<TickSample> researchTicks,
+            BigDecimal stake,
+            boolean skip,
+            boolean recoveryTrade,
+            boolean opened,
+            double openQuote,
+            int ticksAfterOpen
+    ) {}
+
+    private record VirtualSettlement(
+            VirtualTrade trade,
+            Instant closeAt,
+            double closeQuote,
+            boolean success
+    ) {}
+
+    private record VirtualProgress(
+            VirtualTrade trade,
+            VirtualSettlement settlement
+    ) {}
 }
