@@ -7,6 +7,7 @@ import com.zoosool.model.TickEvent;
 import com.zoosool.model.TickSample;
 import com.zoosool.model.TickStatsSnapshot;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Arrays;
@@ -26,6 +27,10 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
     private static final int RESEARCH_WINDOW_SECONDS = 120;
 
+    private static final int MA50_PERIOD = 50;
+    private static final int MA50_EXHAUSTION_MIN_AGE_SECONDS = 40;
+    private static final int MA50_EXHAUSTION_WINDOW = 10;
+
     // периоды MA для сбора значений/стороны/пересечений (на текущем тике)
     private static final int[] MA_PERIODS = {16, 20, 50};
 
@@ -43,6 +48,13 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
     // память знака (price - ma) по каждому периоду — для пересечений на текущем тике
     private final Map<Integer, Integer> prevMaSign = new java.util.HashMap<>();
+
+    // последнее пересечение MA50 и направление движения после него
+    private Instant lastMa50CrossAt = null;
+    private int lastMa50CrossDirection = 0;
+
+    // максимальный/минимальный экстремум после последнего пересечения MA50
+    private Double ma50ExtremeSinceCross = null;
 
     public DefaultTickStatsCalculator(String symbol, TickStatsSink sink) {
         this.symbol = Objects.requireNonNull(symbol, "symbol");
@@ -98,6 +110,11 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
         head = 0;
         lastQuoteText = null;
         prevMaSign.clear();
+
+        lastMa50CrossAt = null;
+        lastMa50CrossDirection = 0;
+        ma50ExtremeSinceCross = null;
+
         clearResearchTicks();
 
         if (sink instanceof Resetable) {
@@ -156,9 +173,11 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                 null, null,
                 null, null,
                 0,
+                null,
+                null,
                 "RESET",
                 at,
-                Map.of()                 // movingAverages пусто на warmup
+                Map.of()
         );
     }
 
@@ -193,6 +212,15 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
 
         Map<Integer, MaPoint> movingAverages = computeMovingAverages(lastQuote);
 
+        updateMa50State(at, lastQuote, movingAverages);
+
+        Long secondsSinceMa50Cross = computeSecondsSinceMa50Cross(at);
+
+        Integer ma50ExhaustionScore = computeMa50ExhaustionScore(
+                secondsSinceMa50Cross,
+                movingAverages
+        );
+
         return new TickStatsSnapshot(
                 symbol,
                 state,
@@ -209,10 +237,254 @@ public final class DefaultTickStatsCalculator implements TickStatsCalculator {
                 lastQuote,
                 lastQuoteString,
                 zeroShort,
+                ma50ExhaustionScore,
+                secondsSinceMa50Cross,
                 reason,
                 at,
                 movingAverages
         );
+    }
+
+    private void updateMa50State(
+            Instant at,
+            Double lastQuote,
+            Map<Integer, MaPoint> movingAverages
+    ) {
+        if (lastQuote == null) {
+            return;
+        }
+
+        MaPoint ma50 = movingAverages.get(MA50_PERIOD);
+        if (ma50 == null) {
+            return;
+        }
+
+        if (ma50.cross() != 0) {
+            lastMa50CrossAt = at;
+            lastMa50CrossDirection = ma50.cross();
+            ma50ExtremeSinceCross = lastQuote;
+            return;
+        }
+
+        if (lastMa50CrossAt == null || lastMa50CrossDirection == 0) {
+            return;
+        }
+
+        if (ma50ExtremeSinceCross == null) {
+            ma50ExtremeSinceCross = lastQuote;
+            return;
+        }
+
+        if (lastMa50CrossDirection > 0) {
+            ma50ExtremeSinceCross = Math.max(ma50ExtremeSinceCross, lastQuote);
+        } else {
+            ma50ExtremeSinceCross = Math.min(ma50ExtremeSinceCross, lastQuote);
+        }
+    }
+
+    private Long computeSecondsSinceMa50Cross(Instant at) {
+        if (lastMa50CrossAt == null) {
+            return null;
+        }
+
+        long seconds = Duration.between(lastMa50CrossAt, at).getSeconds();
+        return Math.max(seconds, 0L);
+    }
+
+    private Integer computeMa50ExhaustionScore(
+            Long secondsSinceMa50Cross,
+            Map<Integer, MaPoint> movingAverages
+    ) {
+        if (secondsSinceMa50Cross == null
+                || secondsSinceMa50Cross < MA50_EXHAUSTION_MIN_AGE_SECONDS) {
+            return null;
+        }
+
+        if (lastMa50CrossDirection == 0) {
+            return null;
+        }
+
+        MaPoint ma50 = movingAverages.get(MA50_PERIOD);
+        if (ma50 == null) {
+            return null;
+        }
+
+        if (size < MA50_PERIOD + MA50_EXHAUSTION_WINDOW) {
+            return null;
+        }
+
+        Double step = symbolStep();
+        if (step == null || step <= 0.0) {
+            return null;
+        }
+
+        double quoteNow = quoteTicksAgo(0);
+        double quote10 = quoteTicksAgo(MA50_EXHAUSTION_WINDOW);
+
+        Double maNow = computeMaAtOffset(MA50_PERIOD, 0);
+        Double ma10 = computeMaAtOffset(MA50_PERIOD, MA50_EXHAUSTION_WINDOW);
+
+        if (maNow == null || ma10 == null) {
+            return null;
+        }
+
+        double distanceNow = Math.abs(quoteNow - maNow) / step;
+        double distance10 = Math.abs(quote10 - ma10) / step;
+
+        double distanceChange = distanceNow - distance10;
+
+        double netTrendMove =
+                ((quoteNow - quote10) * lastMa50CrossDirection) / step;
+
+        int newExtremes = computeNewExtremesLast10();
+
+        double pullbackFromExtreme = computePullbackFromMa50Extreme(step);
+
+        double trendTickShare = computeTrendTickShareLast10();
+
+        int score = 0;
+
+        // 1. Цена уже сравнительно близко к MA50
+        if (distanceNow <= 4.0) {
+            score++;
+        }
+
+        // 2. За последние 10 секунд расстояние до MA уменьшилось хотя бы на шаг
+        if (distanceChange <= -1.0) {
+            score++;
+        }
+
+        // 3. За последние 10 секунд нет чистого прогресса по старому направлению
+        if (netTrendMove <= 0.0) {
+            score++;
+        }
+
+        // 4. Старый тренд почти перестал обновлять экстремумы
+        if (newExtremes <= 2) {
+            score++;
+        }
+
+        // 5. От достигнутого после пробоя экстремума уже есть откат >= 2 шагов
+        if (pullbackFromExtreme >= 2.0) {
+            score++;
+        }
+
+        // 6. Не более 60% последних тиков продолжают старое направление
+        if (trendTickShare <= 0.60) {
+            score++;
+        }
+
+        return score;
+    }
+
+    private int computeNewExtremesLast10() {
+        if (size < MA50_EXHAUSTION_WINDOW + 1) {
+            return 0;
+        }
+
+        double extreme = quoteTicksAgo(MA50_EXHAUSTION_WINDOW);
+        int count = 0;
+
+        for (int ticksAgo = MA50_EXHAUSTION_WINDOW - 1; ticksAgo >= 0; ticksAgo--) {
+            double quote = quoteTicksAgo(ticksAgo);
+
+            if (lastMa50CrossDirection > 0) {
+                if (quote > extreme) {
+                    extreme = quote;
+                    count++;
+                }
+            } else {
+                if (quote < extreme) {
+                    extreme = quote;
+                    count++;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    private double computePullbackFromMa50Extreme(double step) {
+        if (ma50ExtremeSinceCross == null || size == 0) {
+            return 0.0;
+        }
+
+        double quoteNow = lastQuote();
+
+        if (lastMa50CrossDirection > 0) {
+            return Math.max(0.0, (ma50ExtremeSinceCross - quoteNow) / step);
+        }
+
+        return Math.max(0.0, (quoteNow - ma50ExtremeSinceCross) / step);
+    }
+
+    private double computeTrendTickShareLast10() {
+        if (size < MA50_EXHAUSTION_WINDOW + 1) {
+            return 0.0;
+        }
+
+        int trendTicks = 0;
+
+        double prev = quoteTicksAgo(MA50_EXHAUSTION_WINDOW);
+
+        for (int ticksAgo = MA50_EXHAUSTION_WINDOW - 1; ticksAgo >= 0; ticksAgo--) {
+            double cur = quoteTicksAgo(ticksAgo);
+
+            int direction = Double.compare(cur - prev, 0.0);
+            if (direction == lastMa50CrossDirection) {
+                trendTicks++;
+            }
+
+            prev = cur;
+        }
+
+        return (double) trendTicks / (double) MA50_EXHAUSTION_WINDOW;
+    }
+
+    private Double computeMaAtOffset(int period, int ticksAgo) {
+        if (ticksAgo < 0 || size < period + ticksAgo) {
+            return null;
+        }
+
+        int idx = head - 1 - ticksAgo;
+
+        while (idx < 0) {
+            idx += LONG_WINDOW;
+        }
+
+        double sum = 0.0;
+
+        for (int k = 0; k < period; k++) {
+            int maIdx = idx - k;
+            while (maIdx < 0) {
+                maIdx += LONG_WINDOW;
+            }
+
+            sum += quotes[maIdx];
+        }
+
+        return sum / period;
+    }
+
+    private double quoteTicksAgo(int ticksAgo) {
+        int idx = head - 1 - ticksAgo;
+
+        while (idx < 0) {
+            idx += LONG_WINDOW;
+        }
+
+        return quotes[idx];
+    }
+
+    private Double symbolStep() {
+        return switch (symbol) {
+            case "stpRNG" -> 0.1;
+            case "stpRNG2" -> 0.2;
+            case "stpRNG3" -> 0.3;
+            case "stpRNG4" -> 0.4;
+            case "stpRNG5" -> 0.5;
+            default -> null;
+        };
     }
 
     // ── MA value + side + crossing on current tick ───────────────────────

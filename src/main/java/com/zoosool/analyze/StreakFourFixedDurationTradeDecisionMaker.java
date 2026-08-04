@@ -1,4 +1,3 @@
-// StreakFourFixedDurationTradeDecisionMaker.java
 package com.zoosool.analyze;
 
 import com.zoosool.deriv.BalanceHolder;
@@ -12,19 +11,15 @@ import com.zoosool.model.TickStatsSnapshot;
 import com.zoosool.state.TradeWindowState;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -34,17 +29,25 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // Money management
     // -------------------------------------------------------------------------
 
-    private static final BigDecimal PAYOUT = BigDecimal.valueOf(0.976);
-    private static final BigDecimal DYNAMIC_TARGET_PROFIT = BigDecimal.valueOf(0.50);
-    private static final BigDecimal DYNAMIC_MAX_STAKE = BigDecimal.valueOf(10);
+    private static final BigDecimal[] LADDER_STAKES = {
+            BigDecimal.ONE,
+            BigDecimal.valueOf(2),
+            BigDecimal.valueOf(4),
+            BigDecimal.valueOf(8)
+    };
 
     // -------------------------------------------------------------------------
-    // 7+ recovery
+    // Win rate regime
     // -------------------------------------------------------------------------
 
-    private static final int RECOVERY_FAIL_STREAK = 7;
-    private static final int RECOVERY_TRADE_COUNT = 5;
-    private static final BigDecimal RECOVERY_FIXED_STAKE = BigDecimal.valueOf(100);
+    private static final int INITIAL_MIN_TRADES = 50;
+    private static final double INITIAL_START_WIN_RATE = 0.51;
+
+    private static final int REAL_MIN_TRADES = 50;
+    private static final double REAL_STOP_WIN_RATE = 0.48;
+
+    private static final int RESUME_BLOCK_SIZE = 30;
+    private static final double RESUME_WIN_RATE = 0.50;
 
     // -------------------------------------------------------------------------
     // Contract
@@ -76,8 +79,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // -------------------------------------------------------------------------
     // Trading state
     // -------------------------------------------------------------------------
-
-    private BigDecimal cyclePnL = BigDecimal.ZERO;
 
     private int ladderIdx = 0;
 
@@ -113,19 +114,25 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private final Map<String, Instant> blockedAfterFailBySymbol = new HashMap<>();
 
     // -------------------------------------------------------------------------
-    // RAW statistics / 7+
-    //
-    // Считается только по VIRTUAL результатам.
-    //
-    // Поэтому обычный MA16-SKIP не меняет RAW-последовательность:
-    // skipped signal всё равно получает виртуальный SUCCESS / FAIL.
+    // Win rate regime
     // -------------------------------------------------------------------------
 
-    private int rawFailStreak = 0;
-    private boolean recoveryWaitingSuccess = false;
+    private boolean realRegimeEnabled = false;
+    private boolean realRegimeEverStarted = false;
 
-    // Сколько следующих ПРИНЯТЫХ RAW-сигналов реально торгуем fixed 100.
-    private int recoveryTradesRemaining = 0;
+    // До первого REAL считаем cumulative WR от начала сессии.
+    private int initialVirtualTrades = 0;
+    private int initialVirtualSuccess = 0;
+
+    // После включения REAL считаем новый WR только от точки включения.
+    private int realRegimeTrades = 0;
+    private int realRegimeSuccess = 0;
+
+    // После остановки REAL проверяем независимые блоки по 30 virtual.
+    private int resumeBlockTrades = 0;
+    private int resumeBlockSuccess = 0;
+
+    private final AtomicInteger maxStakeMetronomeCount = new AtomicInteger(3);
 
     // -------------------------------------------------------------------------
     // Stop state
@@ -160,6 +167,9 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
         tradeWindowState.autoTradeEnabledProperty().addListener((obs, oldV, newV) -> {
             this.tradingEnabled = newV;
+            if (tradingEnabled) {
+                this.maxStakeMetronomeCount.set(3);
+            }
 
             if (newV) {
                 TradeMode m = tradeWindowState.getTradeMode();
@@ -257,7 +267,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         TradePlan plan = null;
 
         boolean skip;
-        boolean recoveryTrade;
+        boolean regimeWait;
         long tradeSeq;
         StakeSnapshot stake;
 
@@ -280,17 +290,16 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             if (isSnapBusyLocked()) return;
             if (stopped) return;
 
-            recoveryTrade = recoveryTradesRemaining > 0;
-
-            skip = !recoveryTrade && shouldSkipLocked(symbol, snapshot, researchTicks);
+            skip = shouldSkipLocked(symbol, snapshot, researchTicks);
+            regimeWait = !skip && !realRegimeEnabled;
 
             tradeSeq = nextTradeSeq++;
 
-            // Для SKIP фиксируем ту ставку, которая была бы сделана
+            // Для SKIP / WAIT фиксируем ту ставку, которая была бы сделана
             // обычной стратегией.
             //
-            // На cyclePnL она не влияет.
-            stake = recoveryTrade ? snapshotRecoveryStakeLocked() : snapshotDynamicStakeLocked();
+            // На реальную лестницу она не влияет.
+            stake = snapshotLadderStakeLocked();
 
             // -------------------------------------------------------------
             // EVERY ACCEPTED SNAP -> VIRTUAL
@@ -301,7 +310,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
             virtualTrades.put(tradeSeq, new VirtualTrade(
                     tradeSeq, symbol, signalDirection, sentAt, snapshot, researchTicks,
-                    stake.stakePerSide(), skip, recoveryTrade, false, 0.0, 0));
+                    stake.stakePerSide(), skip, regimeWait, false, 0.0, 0));
 
             if (skip) {
                 log.accept("🟨 SNAP_SKIP"
@@ -311,18 +320,22 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                         + " dir=" + signalDirection
                         + " virtualStake=" + stake.stakePerSide()
                         + " reason=WAIT_MA16_CROSS"
-                        + " signalAt=" + snapshot.at()
-                        + " rawFailStreak=" + rawFailStreak
-                        + " recoveryWaitingSuccess=" + recoveryWaitingSuccess
-                        + " recoveryTradesRemaining=" + recoveryTradesRemaining);
+                        + " signalAt=" + snapshot.at());
                 return;
             }
 
-            if (recoveryTrade) {
-                // Считаем именно количество следующих ПРИНЯТЫХ сигналов.
-                //
-                // Сделка сейчас уже принята, поэтому уменьшаем счётчик.
-                recoveryTradesRemaining = Math.max(0, recoveryTradesRemaining - 1);
+            if (regimeWait) {
+                log.accept("🟨 SNAP_REGIME_WAIT"
+                        + " time=" + ldt
+                        + " tradeSeq=" + tradeSeq
+                        + " symbol=" + symbol
+                        + " dir=" + signalDirection
+                        + " virtualStake=" + stake.stakePerSide()
+                        + " signalAt=" + snapshot.at()
+                        + " initial=" + initialVirtualSuccess + "/" + initialVirtualTrades
+                        + " realRegime=" + realRegimeSuccess + "/" + realRegimeTrades
+                        + " resumeBlock=" + resumeBlockSuccess + "/" + resumeBlockTrades);
+                return;
             }
 
             Contract contract = new Contract(
@@ -337,7 +350,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                     tradeSeq, nowEpochSecond, sentAt, ldt, symbol,
                     snapshot.lastQuote() == null ? 0L : Math.round(snapshot.lastQuote()),
                     contract, stake, signalDirection, tradeDirection,
-                    snapshot, researchTicks, recoveryTrade);
+                    snapshot, researchTicks);
         }
 
         log.accept("🟪 SNAP_TRADE"
@@ -349,10 +362,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 + " dir=" + plan.tradeDirection()
                 + " stakePerSide=" + plan.stake().stakePerSide()
                 + " ladderIdx=" + plan.stake().ladderIdxAtSend()
-                + " recovery=" + plan.recoveryTrade()
-                + " cyclePnL=" + cyclePnL
-                + " rawFailStreak=" + rawFailStreak
-                + " recoveryTradesRemaining=" + recoveryTradesRemaining
                 + " durationSec=" + CONTRACT_DURATION_SECONDS
                 + " researchTicks=" + plan.researchTicks().size());
 
@@ -478,13 +487,13 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             VirtualTrade opened = new VirtualTrade(
                     trade.tradeSeq(), trade.symbol(), trade.direction(), trade.signalAt(),
                     trade.signalSnapshot(), trade.researchTicks(), trade.stake(),
-                    trade.skip(), trade.recoveryTrade(), true, quote, 0);
+                    trade.skip(), trade.regimeWait(), true, quote, 0);
 
             log.accept("🟦 VIRTUAL_OPEN"
                     + " tradeSeq=" + trade.tradeSeq()
                     + " symbol=" + trade.symbol()
                     + " skip=" + trade.skip()
-                    + " recovery=" + trade.recoveryTrade()
+                    + " regimeWait=" + trade.regimeWait()
                     + " dir=" + trade.direction()
                     + " signalAt=" + trade.signalAt()
                     + " openAt=" + tickAt
@@ -499,7 +508,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             VirtualTrade updated = new VirtualTrade(
                     trade.tradeSeq(), trade.symbol(), trade.direction(), trade.signalAt(),
                     trade.signalSnapshot(), trade.researchTicks(), trade.stake(),
-                    trade.skip(), trade.recoveryTrade(), true, trade.openQuote(), ticksAfterOpen);
+                    trade.skip(), trade.regimeWait(), true, trade.openQuote(), ticksAfterOpen);
 
             return new VirtualProgress(updated, null);
         }
@@ -526,24 +535,32 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
         LocalDateTime ldt = LocalDateTime.ofInstant(settlement.closeAt(), zone);
 
-        int prevRawFailStreak;
-        int newRawFailStreak;
-        boolean recoveryStarted;
-
         synchronized (this) {
-            prevRawFailStreak = rawFailStreak;
-            recoveryStarted = registerRawSnapResultLocked(success);
-            newRawFailStreak = rawFailStreak;
-
             virtualResults.put(trade.tradeSeq(), success);
+
+            if (!trade.skip()) {
+                if (!success) {
+                    blockedAfterFailBySymbol.put(trade.symbol(), trade.signalSnapshot().at());
+                }
+
+                registerRegimeResultLocked(success);
+            }
         }
 
         // ---------------------------------------------------------------------
         // Отдельный полный virtual log.
         //
-        // SKIP здесь выглядит почти как обычная сделка,
-        // только error содержит VIRTUAL_SKIP.
+        // SKIP / WAIT здесь выглядят как обычные virtual сделки,
+        // но error содержит причину, почему REAL не отправлялся.
         // ---------------------------------------------------------------------
+
+        String virtualReason = null;
+
+        if (trade.skip()) {
+            virtualReason = "VIRTUAL_SKIP";
+        } else if (trade.regimeWait()) {
+            virtualReason = "VIRTUAL_REGIME_WAIT";
+        }
 
         virtualSnapLogger.log(new SnapTradeLogger.Entry(
                 trade.tradeSeq(),
@@ -556,7 +573,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 trade.stake(),
                 success ? "SUCCESS" : "FAIL",
                 0,
-                trade.skip() ? "VIRTUAL_SKIP" : "VIRTUAL_REAL_MIRROR",
+                virtualReason == null ? "VIRTUAL_REAL_MIRROR" : virtualReason,
                 trade.signalSnapshot(),
                 trade.researchTicks()));
 
@@ -565,103 +582,125 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 + " tradeSeq=" + trade.tradeSeq()
                 + " symbol=" + trade.symbol()
                 + " skip=" + trade.skip()
-                + " recovery=" + trade.recoveryTrade()
+                + " regimeWait=" + trade.regimeWait()
                 + " dir=" + trade.direction()
                 + " openQuote=" + trade.openQuote()
                 + " closeQuote=" + settlement.closeQuote()
                 + " result=" + (success ? "SUCCESS" : "FAIL")
-                + " rawFailStreak " + prevRawFailStreak + "->" + newRawFailStreak
-                + " recoveryStarted=" + recoveryStarted
-                + " recoveryWaitingSuccess=" + recoveryWaitingSuccess
-                + " recoveryTradesRemaining=" + recoveryTradesRemaining);
+                + " realRegimeEnabled=" + realRegimeEnabled
+                + " initial=" + initialVirtualSuccess + "/" + initialVirtualTrades
+                + " realRegime=" + realRegimeSuccess + "/" + realRegimeTrades
+                + " resumeBlock=" + resumeBlockSuccess + "/" + resumeBlockTrades);
 
-        if (!trade.skip()) {
+        if (!trade.skip() && !trade.regimeWait()) {
             logRealVirtualComparison(trade.tradeSeq());
         }
 
-        cleanupResultState(trade.tradeSeq(), trade.skip());
+        cleanupResultState(trade.tradeSeq(), trade.skip() || trade.regimeWait());
     }
 
     // -------------------------------------------------------------------------
-    // RAW 7+
+    // Win rate regime
     // -------------------------------------------------------------------------
 
-    private boolean registerRawSnapResultLocked(boolean success) {
-        if (!success) {
-            rawFailStreak++;
+    private void registerRegimeResultLocked(boolean success) {
+        if (!realRegimeEverStarted) {
+            initialVirtualTrades++;
+            if (success) initialVirtualSuccess++;
 
-            if (rawFailStreak >= RECOVERY_FAIL_STREAK) {
-                recoveryWaitingSuccess = true;
+            if (initialVirtualTrades >= INITIAL_MIN_TRADES
+                    && winRate(initialVirtualSuccess, initialVirtualTrades) >= INITIAL_START_WIN_RATE) {
+
+                realRegimeEnabled = true;
+                realRegimeEverStarted = true;
+
+                realRegimeTrades = 0;
+                realRegimeSuccess = 0;
+
+                log.accept("🟩 SNAP_REGIME_ON"
+                        + " reason=INITIAL_WR"
+                        + " success=" + initialVirtualSuccess
+                        + " total=" + initialVirtualTrades
+                        + " winRate=" + winRate(initialVirtualSuccess, initialVirtualTrades));
             }
 
-            return false;
+            return;
         }
 
-        boolean recoveryStarted = false;
+        if (realRegimeEnabled) {
+            realRegimeTrades++;
+            if (success) realRegimeSuccess++;
 
-        // Именно первый SUCCESS, завершивший 7+ RAW FAIL.
-        //
-        // Он сам НЕ входит в fixed100 window.
-        // Fixed100 начинается со следующего принятого RAW signal.
-        if (recoveryWaitingSuccess
-                && rawFailStreak >= RECOVERY_FAIL_STREAK
-                && recoveryTradesRemaining == 0) {
+            if (realRegimeTrades >= REAL_MIN_TRADES
+                    && winRate(realRegimeSuccess, realRegimeTrades) < REAL_STOP_WIN_RATE) {
 
-            recoveryTradesRemaining = RECOVERY_TRADE_COUNT;
-            recoveryStarted = true;
+                realRegimeEnabled = false;
 
-            log.accept("🟦 RAW_RECOVERY_START"
-                    + " failStreak=" + rawFailStreak
-                    + " fixedStake=" + RECOVERY_FIXED_STAKE
-                    + " trades=" + RECOVERY_TRADE_COUNT);
+                resumeBlockTrades = 0;
+                resumeBlockSuccess = 0;
+
+                log.accept("🟥 SNAP_REGIME_OFF"
+                        + " reason=REAL_WR"
+                        + " success=" + realRegimeSuccess
+                        + " total=" + realRegimeTrades
+                        + " winRate=" + winRate(realRegimeSuccess, realRegimeTrades));
+            }
+
+            return;
         }
 
-        rawFailStreak = 0;
-        recoveryWaitingSuccess = false;
+        resumeBlockTrades++;
+        if (success) resumeBlockSuccess++;
 
-        return recoveryStarted;
-    }
+        if (resumeBlockTrades < RESUME_BLOCK_SIZE) return;
 
-    // -------------------------------------------------------------------------
-    // Dynamic ladder
-    //
-    // Пример:
-    //
-    // 1F -> 2F -> 4F -> 8F -> 10F -> 10 -> 10...
-    //
-    // После каждого результата выбирается минимальная целая ставка,
-    // которая при SUCCESS доведёт cyclePnL минимум до targetProfit.
-    //
-    // Сверху cap = 10.
-    //
-    // Никакого STOP по глубине.
-    // -------------------------------------------------------------------------
+        double wr = winRate(resumeBlockSuccess, resumeBlockTrades);
 
-    private StakeSnapshot snapshotDynamicStakeLocked() {
-        BigDecimal requiredProfit = DYNAMIC_TARGET_PROFIT.subtract(cyclePnL);
+        if (wr >= RESUME_WIN_RATE) {
+            realRegimeEnabled = true;
 
-        BigDecimal stake;
+            realRegimeTrades = 0;
+            realRegimeSuccess = 0;
 
-        if (requiredProfit.signum() <= 0) {
-            stake = BigDecimal.ONE;
+            log.accept("🟩 SNAP_REGIME_ON"
+                    + " reason=RESUME_BLOCK"
+                    + " success=" + resumeBlockSuccess
+                    + " total=" + resumeBlockTrades
+                    + " winRate=" + wr);
         } else {
-            stake = requiredProfit.divide(PAYOUT, 0, RoundingMode.CEILING);
-
-            if (stake.compareTo(BigDecimal.ONE) < 0) stake = BigDecimal.ONE;
-            if (stake.compareTo(DYNAMIC_MAX_STAKE) > 0) stake = DYNAMIC_MAX_STAKE;
+            log.accept("🟨 SNAP_REGIME_WAIT_BLOCK"
+                    + " success=" + resumeBlockSuccess
+                    + " total=" + resumeBlockTrades
+                    + " winRate=" + wr);
         }
 
-        return new StakeSnapshot(ladderIdx, stake);
+        resumeBlockTrades = 0;
+        resumeBlockSuccess = 0;
     }
 
-    private StakeSnapshot snapshotRecoveryStakeLocked() {
-        return new StakeSnapshot(ladderIdx, RECOVERY_FIXED_STAKE);
+    private static double winRate(int success, int total) {
+        if (total <= 0) return 0.0;
+        return (double) success / total;
+    }
+
+    // -------------------------------------------------------------------------
+    // Fixed ladder
+    //
+    // 1F -> 2F -> 4F -> 8F -> STOP -> 1
+    //
+    // Любой SUCCESS -> 1.
+    //
+    // После FAIL на 8 старый убыток фиксируется,
+    // следующая лестница начинается заново с 1.
+    // -------------------------------------------------------------------------
+
+    private StakeSnapshot snapshotLadderStakeLocked() {
+        return new StakeSnapshot(ladderIdx, LADDER_STAKES[ladderIdx]);
     }
 
     private BigDecimal nextStakeForLog() {
         synchronized (this) {
-            if (recoveryTradesRemaining > 0) return RECOVERY_FIXED_STAKE;
-            return snapshotDynamicStakeLocked().stakePerSide();
+            return snapshotLadderStakeLocked().stakePerSide();
         }
     }
 
@@ -692,10 +731,13 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
         if (!tradingEnabled) return;
 
-        if (dir == DerivTradingService.Direction.UP) {
-            trading.buyRise(contract);
-        } else {
-            trading.buyFall(contract);
+        if (maxStakeMetronomeCount.get() > 0) {
+            if (dir == DerivTradingService.Direction.UP) {
+                trading.buyRise(contract);
+            } else {
+                trading.buyFall(contract);
+            }
+            maxStakeMetronomeCount.addAndGet(- 1);
         }
     }
 
@@ -760,9 +802,6 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         int prevIdx;
         int newIdx;
 
-        BigDecimal prevCyclePnL;
-        BigDecimal newCyclePnL;
-
         synchronized (this) {
 
             if (plan.tradeSeq() <= lastSettledTradeSeq) {
@@ -785,44 +824,16 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             // Уже отправленный REAL обязательно обрабатываем.
 
             prevIdx = ladderIdx;
-            prevCyclePnL = cyclePnL;
 
-            // -------------------------------------------------------------
-            // MA16 block
-            //
-            // Только обычная стратегия.
-            //
-            // Fixed100 recovery — отдельная стратегия и normal blocking
-            // не меняет.
-            // -------------------------------------------------------------
-
-            if (!plan.recoveryTrade() && !success) {
-                blockedAfterFailBySymbol.put(plan.symbol(), plan.signalSnapshot().at());
-            }
-
-            // -------------------------------------------------------------
-            // Dynamic cycle PnL
-            //
-            // Recovery fixed100 не вмешивается в обычную лестницу.
-            // -------------------------------------------------------------
-
-            if (!plan.recoveryTrade()) {
-                BigDecimal delta = success
-                        ? plan.stake().stakePerSide().multiply(PAYOUT)
-                        : plan.stake().stakePerSide().negate();
-
-                cyclePnL = cyclePnL.add(delta);
-
-                if (cyclePnL.compareTo(DYNAMIC_TARGET_PROFIT) >= 0) {
-                    cyclePnL = BigDecimal.ZERO;
-                    ladderIdx = 0;
-                } else {
-                    ladderIdx++;
-                }
+            if (success) {
+                ladderIdx = 0;
+            } else if (ladderIdx >= LADDER_STAKES.length - 1) {
+                ladderIdx = 0;
+            } else {
+                ladderIdx++;
             }
 
             newIdx = ladderIdx;
-            newCyclePnL = cyclePnL;
 
             realResults.put(plan.tradeSeq(), success);
         }
@@ -853,9 +864,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                     + " symbol=" + plan.symbol()
                     + " res=SUCCESS"
                     + exText
-                    + " recovery=" + plan.recoveryTrade()
                     + " ladder " + prevIdx + "->" + newIdx
-                    + " cyclePnL " + prevCyclePnL + "->" + newCyclePnL
                     + " nextStake=" + nextStakeForLog());
         } else {
             log.accept("❌ RESULT"
@@ -864,9 +873,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                     + " symbol=" + plan.symbol()
                     + " res=FAIL"
                     + exText
-                    + " recovery=" + plan.recoveryTrade()
                     + " ladder " + prevIdx + "->" + newIdx
-                    + " cyclePnL " + prevCyclePnL + "->" + newCyclePnL
                     + " nextStake=" + nextStakeForLog());
         }
 
@@ -898,11 +905,11 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
                 + " same=" + Objects.equals(real, virtual));
     }
 
-    private void cleanupResultState(long tradeSeq, boolean skip) {
-        if (!skip) return;
+    private void cleanupResultState(long tradeSeq, boolean virtualOnly) {
+        if (!virtualOnly) return;
 
         synchronized (this) {
-            // У SKIP никогда не будет realResult,
+            // У SKIP / WAIT никогда не будет realResult,
             // поэтому virtual result после логирования можно удалить.
             virtualResults.remove(tradeSeq);
         }
@@ -950,8 +957,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             DerivTradingService.Direction signalDirection,
             DerivTradingService.Direction tradeDirection,
             TickStatsSnapshot signalSnapshot,
-            List<TickSample> researchTicks,
-            boolean recoveryTrade
+            List<TickSample> researchTicks
     ) {
         int durationSeconds() {
             return CONTRACT_DURATION_SECONDS;
@@ -967,7 +973,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
             List<TickSample> researchTicks,
             BigDecimal stake,
             boolean skip,
-            boolean recoveryTrade,
+            boolean regimeWait,
             boolean opened,
             double openQuote,
             int ticksAfterOpen

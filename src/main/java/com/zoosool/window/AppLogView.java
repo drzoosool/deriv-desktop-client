@@ -26,12 +26,12 @@ public class AppLogView {
     }
 
     public void log(String msg) {
-        String line = "[" + LocalTime.now().format(TS) + "] " + msg + "\n";
-        if (Platform.isFxApplicationThread()) {
-            area.appendText(line);
-        } else {
-            Platform.runLater(() -> area.appendText(line));
-        }
+//        String line = "[" + LocalTime.now().format(TS) + "] " + msg + "\n";
+//        if (Platform.isFxApplicationThread()) {
+//            area.appendText(line);
+//        } else {
+//            Platform.runLater(() -> area.appendText(line));
+//        }
     }
 
     public Consumer<String> logger() {
