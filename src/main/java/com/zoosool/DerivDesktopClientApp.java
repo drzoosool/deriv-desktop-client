@@ -53,7 +53,7 @@ public class DerivDesktopClientApp extends Application {
                 appLogView.logger()
         );
 
-        tickStatsExecutor = Executors.newFixedThreadPool(5, newDaemonThreadFactory("tick-stats-"));
+        tickStatsExecutor = Executors.newFixedThreadPool(13, newDaemonThreadFactory("tick-stats-"));
 
         DerivCurrencyHolder derivCurrencyHolder = new DerivCurrencyHolder();
         DerivConnectorHolder derivConnectorHolder = new DerivConnectorHolder();

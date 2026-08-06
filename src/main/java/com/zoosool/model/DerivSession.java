@@ -8,7 +8,7 @@ public record DerivSession(
 ) {
     public List<ActiveSymbol> stepIndices() {
         return activeSymbols.stream()
-                .filter(s -> s.displayName().toLowerCase(java.util.Locale.ROOT).contains("step index"))
+                .filter(s -> s.symbol().startsWith("stpRNG") || s.symbol().startsWith("1HZ"))
                 .toList();
     }
 }

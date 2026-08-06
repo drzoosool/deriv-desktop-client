@@ -59,6 +59,12 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
 
     private volatile boolean tradingEnabled = false;
 
+    // снимок параметров метронома: пишется на JavaFX-потоке при включении,
+    // читается потоком тиков. volatile -> видимость гарантирована.
+    private volatile DerivTradingService.Direction metroDir;
+    private volatile BigDecimal metroStake;
+    private volatile String metroSymbol;
+
     // -------------------------------------------------------------------------
     // Dependencies
     // -------------------------------------------------------------------------
@@ -132,7 +138,8 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     private int resumeBlockTrades = 0;
     private int resumeBlockSuccess = 0;
 
-    private final AtomicInteger maxStakeMetronomeCount = new AtomicInteger(3);
+    private static final int MAX_STAKE_VALUE = 3;
+    private final AtomicInteger maxStakeMetronomeCount = new AtomicInteger(MAX_STAKE_VALUE);
 
     // -------------------------------------------------------------------------
     // Stop state
@@ -166,9 +173,15 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         this.tradingEnabled = tradeWindowState.isAutoTradeEnabled();
 
         tradeWindowState.autoTradeEnabledProperty().addListener((obs, oldV, newV) -> {
-            this.tradingEnabled = newV;
-            if (tradingEnabled) {
-                this.maxStakeMetronomeCount.set(3);
+            if (newV) {
+                this.maxStakeMetronomeCount.set(tradeWindowState.getDuration());
+                var metroSel = tradeWindowState.getSelectedAsset();
+                this.metroDir = tradeWindowState.getDirection();
+                this.metroStake = parseStakeQuiet(tradeWindowState.getStake());
+                this.metroSymbol = (metroSel == null) ? null : metroSel.symbol();
+                this.tradingEnabled = true;
+            } else {
+                this.tradingEnabled = false;
             }
 
             if (newV) {
@@ -222,6 +235,7 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
         if (!tradingEnabled) return;
 
         TradeMode mode = tradeWindowState.getTradeMode();
+        System.out.println("ROUTE mode=" + mode + " sym=" + symbol);
         if (mode == null) return;
 
         switch (mode) {
@@ -714,30 +728,23 @@ public final class StreakFourFixedDurationTradeDecisionMaker implements TradeDec
     // -------------------------------------------------------------------------
 
     private void fireMetronomeTick(String symbol) {
-        var selected = tradeWindowState.getSelectedAsset();
-        if (selected == null || !selected.symbol().equals(symbol)) return;
-
+        System.out.println("tradingEnabled: " + tradingEnabled);
         if (!tradingEnabled) return;
+        System.out.println("metroSymbol: " + metroSymbol + " !metroSymbol.equals(symbol): " + !metroSymbol.equals(symbol));
+        if (metroSymbol == null || !metroSymbol.equals(symbol)) return;
+        System.out.println("metroDir: " + metroDir);
+        if (metroDir == null) return;
+        System.out.println("metroDir: " + metroStake);
+        if (metroStake == null) return;
 
-        DerivTradingService.Direction dir = tradeWindowState.getDirection();
-        if (dir == null) return;
-
-        BigDecimal stake = parseStakeQuiet(tradeWindowState.getStake());
-        if (stake == null) return;
-
-        Contract contract = new Contract(
-                symbol, stake, 1, DEFAULT_DURATION_UNIT,
+        Contract contract = new Contract(symbol, metroStake, 1, DEFAULT_DURATION_UNIT,
                 tradeWindowState.getBasis(), tradeWindowState.isAllowEquals());
 
-        if (!tradingEnabled) return;
-
+        System.out.println("test");
         if (maxStakeMetronomeCount.get() > 0) {
-            if (dir == DerivTradingService.Direction.UP) {
-                trading.buyRise(contract);
-            } else {
-                trading.buyFall(contract);
-            }
-            maxStakeMetronomeCount.addAndGet(- 1);
+            if (metroDir == DerivTradingService.Direction.UP) trading.buyRise(contract);
+            else trading.buyFall(contract);
+            maxStakeMetronomeCount.addAndGet(-1);
         }
     }
 

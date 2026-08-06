@@ -26,6 +26,7 @@ public class AppLogView {
     }
 
     public void log(String msg) {
+//        System.out.println(msg);
 //        String line = "[" + LocalTime.now().format(TS) + "] " + msg + "\n";
 //        if (Platform.isFxApplicationThread()) {
 //            area.appendText(line);
